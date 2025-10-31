@@ -4,8 +4,10 @@ import logging
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.const import CONF_IP, CONF_NAME
+from homeassistant.const import CONF_NAME
 from homeassistant.core import callback
+
+CONF_IP = "ip"
 
 from .const import DOMAIN
 from .tv_controller import HisenseTVController
