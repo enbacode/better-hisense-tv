@@ -273,31 +273,135 @@ class HisenseTVController:
         await asyncio.sleep(0.2)
         await self.disconnect()
 
+
     async def async_start_pairing(self) -> bool:
         """
-        Start pairing process:
-        - connect via MQTT
-        - send app_connect message
-        - wait for TV to show auth code
+        Begin pairing process with TV.
+        Connects to MQTT, sends app_connect message.
+        TV should display a 4-digit code.
+        Returns True if code prompt shown on TV.
         """
-        # basically: everything up to where your old generate_creds() waited for auth code
-        # subscribe to 'authentication' and 'authenticationcode'
-        # send 'vidaa_app_connect' message
-        # wait until TV responds asking for code
-        _LOGGER.info("Starting pairing flow, please check your TV for a 4-digit code...")
-        # store internal state so async_finish_pairing() can continue
-        self._pairing_context = {...}
-        return True  # means code is now shown on TV
+        self.define_hashes()
+        self.define_topic_paths()
 
+        client = self.create_mqtt_client(
+            client_id=self.client_id,
+            certfile=None,  # not used, handled inside
+            keyfile=None,
+            username=self.username,
+            password=self.password,
+        )
+        self._pairing_client = client
+        self._authentication_payload = None
+
+        def on_auth(c, _u, msg):
+            try:
+                payload = msg.payload.decode()
+                _LOGGER.debug("Authentication message received: %s", payload)
+                self._authentication_payload = payload
+            except Exception as e:
+                _LOGGER.error("Error parsing authentication payload: %s", e)
+
+        topic_base = f"/remoteapp/mobile/{self.client_id}/"
+        topic_tvui = f"/remoteapp/tv/ui_service/{self.client_id}/"
+        client.message_callback_add(topic_base + "ui_service/data/authentication", on_auth)
+
+        client.connect_async(self.tv_ip, 36669, 60)
+        client.loop_start()
+
+        # Wait for MQTT connection
+        for _ in range(30):
+            if getattr(client, "connected_flag", False):
+                break
+            await asyncio.sleep(0.2)
+        if not getattr(client, "connected_flag", False):
+            _LOGGER.error("Could not connect to TV at %s", self.tv_ip)
+            return False
+
+        client.subscribe(topic_base + "ui_service/data/authentication")
+        client.publish(topic_tvui + "actions/vidaa_app_connect", json.dumps({
+            "app_version": 2,
+            "connect_result": 0,
+            "device_type": "Mobile App"
+        }))
+
+        # Wait for TV to respond and show pairing code
+        _LOGGER.info("Waiting for TV to show pairing code...")
+        for _ in range(60):
+            if self._authentication_payload is not None:
+                break
+            await asyncio.sleep(0.5)
+
+        if self._authentication_payload is None:
+            _LOGGER.error("No pairing response received from TV.")
+            await self._disconnect_pairing()
+            return False
+
+        _LOGGER.info("TV should now show a 4-digit code. Awaiting user input in HA config flow.")
+        return True
 
     async def async_finish_pairing(self, auth_code: str) -> dict:
         """
-        Finish pairing:
-        - send auth code to TV
-        - receive tokenissuance
-        - return credentials dict
+        Complete the pairing process by sending the 4-digit auth code.
+        Returns credentials dict (tokens etc.)
         """
-        # corresponds to second part of your generate_creds()
-        credentials = {...}  # dict from tokenissuance payload
-        self.apply_credentials(credentials)
-        return credentials
+        client = getattr(self, "_pairing_client", None)
+        if not client:
+            raise RuntimeError("Pairing not started")
+
+        topic_base = f"/remoteapp/mobile/{self.client_id}/"
+        topic_tvui = f"/remoteapp/tv/ui_service/{self.client_id}/"
+        topic_ps = f"/remoteapp/tv/platform_service/{self.client_id}/"
+
+        tokenissuance_event = asyncio.Event()
+        credentials_box = {}
+
+        def on_tokenissuance(_c, _u, msg):
+            try:
+                payload = json.loads(msg.payload.decode())
+                _LOGGER.debug("Token issuance received: %s", payload)
+                credentials_box.update(payload)
+                tokenissuance_event.set()
+            except Exception as e:
+                _LOGGER.error("Error parsing token issuance: %s", e)
+
+        client.message_callback_add(topic_base + "platform_service/data/tokenissuance", on_tokenissuance)
+
+        # Subscribe to topics
+        client.subscribe(topic_base + "ui_service/data/authenticationcode")
+        client.subscribe(topic_base + "platform_service/data/tokenissuance")
+
+        # Send the code
+        _LOGGER.info("Sending 4-digit auth code to TV: %s", auth_code)
+        client.publish(topic_tvui + "actions/authenticationcode", json.dumps({"authNum": auth_code}))
+
+        # Wait for token issuance
+        try:
+            await asyncio.wait_for(tokenissuance_event.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            _LOGGER.error("Timeout waiting for token issuance from TV.")
+            await self._disconnect_pairing()
+            raise
+
+        # Apply credentials and close connection
+        credentials_box.update({
+            "client_id": self.client_id,
+            "username": self.username,
+            "password": self.password,
+        })
+
+        self.apply_credentials(credentials_box)
+        _LOGGER.info("Pairing successful, credentials received.")
+        await self._disconnect_pairing()
+        return credentials_box
+
+    async def _disconnect_pairing(self):
+        """Disconnect the temporary pairing MQTT client."""
+        client = getattr(self, "_pairing_client", None)
+        if client:
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except Exception:
+                pass
+            self._pairing_client = None
