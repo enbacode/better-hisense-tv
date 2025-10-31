@@ -5,6 +5,8 @@ import time
 import random
 import re
 import uuid
+import tempfile
+import ssl
 import hashlib
 from typing import Optional
 
@@ -405,3 +407,33 @@ class HisenseTVController:
             except Exception:
                 pass
             self._pairing_client = None
+
+    def create_mqtt_client(self, client_id, certfile=None, keyfile=None, username=None, password=None, userdata=None):
+        client = mqtt.Client(client_id=client_id, clean_session=True, userdata=userdata, protocol=mqtt.MQTTv311, transport="tcp")
+
+        # Schreibe die Zertifikate temporär in Dateien, da paho-mqtt keine Strings akzeptiert
+        tmp_cert = tempfile.NamedTemporaryFile(delete=False)
+        tmp_key = tempfile.NamedTemporaryFile(delete=False)
+        tmp_cert.write(hisense_cert.encode("utf-8"))
+        tmp_key.write(hisense_key.encode("utf-8"))
+        tmp_cert.flush()
+        tmp_key.flush()
+
+        client.tls_set(
+            ca_certs=None,
+            certfile=tmp_cert.name,
+            keyfile=tmp_key.name,
+            cert_reqs=ssl.CERT_NONE,
+            tls_version=ssl.PROTOCOL_TLS
+        )
+        client.tls_insecure_set(True)
+
+        client.username_pw_set(username=username, password=password)
+
+        client.on_connect = self.on_connect
+        client.on_message = self.on_message
+        client.on_disconnect = self.on_disconnect
+
+        client.connected_flag = False
+        client.cancel_loop = False
+        return client
