@@ -1,4 +1,13 @@
 {
   "name": "Better Hisense TV",
-  "render_readme": true
+  "render_readme": true,
+  "domains": ["media_player", "switch"],
+  "codeowners": ["@enbacode"],
+  "iot_class": "local_push",
+    "requirements": [
+    "paho-mqtt==1.6.1",
+    "keyboard"
+  ],
+  "integration_type": "device",
+  "version": "1.0.0"
 }
