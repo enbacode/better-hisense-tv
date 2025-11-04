@@ -357,7 +357,7 @@ class HisenseTVController:
         """Prüft Gültigkeit des Access Tokens und refreshed falls nötig."""
         assert self.accesstoken and self.accesstoken_time and self.accesstoken_duration_day
         now = time.time()
-        exp = self.accesstoken_time + (self.accesstoken_duration_day * 24 * 60 * 60)
+        exp = int(self.accesstoken_time) + (self.accesstoken_duration_day * 24 * 60 * 60)
 
         if now <= exp:
             if self.debug:
