@@ -32,9 +32,9 @@ class BetterHisenseTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             ip = user_input[CONF_IP]
             self._ip = ip
-            
             certfile = os.path.join(os.path.dirname(__file__), "../certchain_pem.cer")
             keyfile = os.path.join(os.path.dirname(__file__), "../rcm_pem_privkey.pkcs8")
+            _LOGGER.debug("Cert Paths: %s, %s", certfile, keyfile)
 
             # initialize controller
             controller = HisenseTVController(ip, certfile=certfile, keyfile=keyfile)
