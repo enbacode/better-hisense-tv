@@ -1012,13 +1012,13 @@ if __name__ == "__main__":
                     # Power cycle the TV
                     command_sent = auth.power_cycle_tv()
                     if command_sent:
-                        print("Power cycle command sent.")
+                        logging.error("Power cycle command sent.")
                     else:
-                        print("Failed to send power cycle command.")
+                        logging.error("Failed to send power cycle command.")
                 else:
-                    print("TV is already on.")
+                    logging.info("TV is already on.")
             else:
-                print("Failed to get TV state.")
+                logging.error("Failed to get TV state.")
 
         elif action == "POWEROFF":
             # Power off the TV

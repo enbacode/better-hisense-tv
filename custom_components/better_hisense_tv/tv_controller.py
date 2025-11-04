@@ -1,439 +1,610 @@
+"""
+tvcontroller.py — VIDAa/Hisense TV MQTT Controller (async, persistent client)
+
+Beispielnutzung:
+
+    import asyncio
+    from tvcontroller import TVAuthenticator
+
+    async def main():
+        auth = TVAuthenticator(
+            tv_ip="192.168.178.25",
+            certfile="./rcm_certchain_pem.cer",
+            keyfile="./rcm_pem_privkey.pkcs8",
+            random_mac=True,
+            debug=True,
+        )
+
+        # 1) Erst-Authentifizierung (nur einmal nötig). Danach hast du Tokens.
+        #    Falls bereits Tokens vorliegen, kannst du direkt auth.connect_with_access_token() nutzen.
+        async def prompt_code():
+            # Eingabe 4-stelliger Code vom TV
+            return input("Enter the four digits displayed on your TV: ").strip()
+
+        await auth.generate_creds(auth_code_provider=prompt_code)
+        print("Credentials:", auth.credentials_summary())
+
+        # 2) State abrufen
+        state = await auth.get_tv_state()
+        print("TV State:", state)
+
+        # 3) Taste senden
+        await auth.send_key("KEY_POWER")
+
+        # 4) Volume ändern (Beispiel)
+        await auth.change_volume(12)
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+"""
+
 import asyncio
+import hashlib
 import json
 import logging
-import time
+import os
 import random
 import re
-import uuid
-import tempfile
 import ssl
-import hashlib
-from typing import Optional
+import time
+import uuid
+from typing import Callable, Awaitable, Optional, Dict, Any
 
 import paho.mqtt.client as mqtt
-from .keys import hisense_key, hisense_cert
 
-_LOGGER = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Konfiguration & Logging
+# ---------------------------------------------------------------------------
+
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger("tvcontroller")
+
+
+# ---------------------------------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------------------------------
+
+def cross_sum(n: int) -> int:
+    return sum(int(d) for d in str(n))
+
+
+def string_to_hash(s: str) -> str:
+    return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
+
+
+def random_mac_address() -> str:
+    return ":".join(f"{random.randint(0, 255):02x}" for _ in range(6))
+
+
+# ---------------------------------------------------------------------------
+# TVAuthenticator
+# ---------------------------------------------------------------------------
 
 class HisenseTVController:
-    """Async controller for communicating with Hisense Smart TVs via MQTT."""
+    """
+    Persistenter MQTT-Client für VIDAa/Hisense TVs inkl. Auth-Flow, Token-Refresh
+    und bequemen Methoden (get_tv_state, send_key, change_source, etc.).
+    """
 
     def __init__(
         self,
-        ip: str,
-        use_random_mac: bool = True,
-    ):
-        self.tv_ip = ip
-        self.use_random_mac = use_random_mac
+        tv_ip: str,
+        certfile: str,
+        keyfile: str,
+        *,
+        random_mac: bool = True,
+        check_interval: float = 0.1,
+        timeout: float = 60.0,
+        debug: bool = False,
+    ) -> None:
+        # Basis
+        self.tv_ip = tv_ip
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.random_mac = random_mac
+        self.check_interval = check_interval
+        self.timeout = timeout
+        self.debug = debug
 
-        # Credentials / Auth data (set via apply_credentials)
-        self.client_id: Optional[str] = None
-        self.username: Optional[str] = None
-        self.password: Optional[str] = None
+        # MQTT
+        self.client: Optional[mqtt.Client] = None
+        self._connected_evt = asyncio.Event()
+        self._lock = asyncio.Lock()  # serialisiert publish / subscribe
+        self._topic_waiters: Dict[str, asyncio.Future] = {}
+        self._subscriptions: set[str] = set()
+
+        # Credentials/State
+        self.reply = None
+        self.authentication_payload = None
+        self.authentication_code_payload = None
+        self.tokenissuance = None
+        self.info: Optional[str] = None
+
         self.accesstoken: Optional[str] = None
-        self.refreshtoken: Optional[str] = None
         self.accesstoken_time: Optional[int] = None
         self.accesstoken_duration_day: Optional[int] = None
+
+        self.refreshtoken: Optional[str] = None
         self.refreshtoken_time: Optional[int] = None
         self.refreshtoken_duration_day: Optional[int] = None
 
-        # Internal state
-        self._client: Optional[mqtt.Client] = None
-        self._authenticated = False
+        self.client_id: Optional[str] = None
+        self.username: Optional[str] = None
+        self.password: Optional[str] = None
+        self.timestamp: Optional[int] = None
+        self.authenticated: bool = False
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        # Topic-Basen
+        self.topicTVUIBasepath: Optional[str] = None
+        self.topicTVPSBasepath: Optional[str] = None
+        self.topicMobiBasepath: Optional[str] = None
+        self.topicBrcsBasepath: Optional[str] = None
+        self.topicRemoBasepath: Optional[str] = None
 
-    def _cross_sum(self, n: int) -> int:
-        return sum(int(d) for d in str(n))
+    # --------------------------
+    # MQTT low-level
+    # --------------------------
 
-    def _string_to_hash(self, s: str) -> str:
-        return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
-
-    def _random_mac_address(self) -> str:
-        mac = [random.randint(0x00, 0xFF) for _ in range(6)]
-        return ":".join(f"{o:02x}" for o in mac)
-
-    def _topic_paths(self):
-        """Return topic base paths for the current client ID."""
-        cid = self.client_id
-        return {
-            "tv_ui": f"/remoteapp/tv/ui_service/{cid}/",
-            "tv_ps": f"/remoteapp/tv/platform_service/{cid}/",
-            "mobi":  f"/remoteapp/mobile/{cid}/",
-            "brcs":  f"/remoteapp/mobile/broadcast/",
-            "remo":  f"/remoteapp/tv/remote_service/{cid}/",
-        }
-
-    # ------------------------------------------------------------------
-    # MQTT setup
-    # ------------------------------------------------------------------
-
-    def _create_client(self, username: str, password: str) -> mqtt.Client:
-        """Create a preconfigured MQTT client using embedded certs."""
-        client = mqtt.Client(
-            client_id=self.client_id,
-            clean_session=True,
-            protocol=mqtt.MQTTv311,
-            transport="tcp",
-        )
-
-        import ssl
-        import tempfile
-
-        # Write cert/key strings into temporary files for paho
-        cert_tmp = tempfile.NamedTemporaryFile(delete=False)
-        key_tmp = tempfile.NamedTemporaryFile(delete=False)
-        cert_tmp.write(hisense_cert.encode("utf-8"))
-        key_tmp.write(hisense_key.encode("utf-8"))
-        cert_tmp.flush()
-        key_tmp.flush()
-
+    def _build_client(self, client_id: str, username: str, password: str) -> mqtt.Client:
+        client = mqtt.Client(client_id=client_id, clean_session=True, protocol=mqtt.MQTTv311, transport="tcp")
         client.tls_set(
             ca_certs=None,
-            certfile=cert_tmp.name,
-            keyfile=key_tmp.name,
+            certfile=self.certfile,
+            keyfile=self.keyfile,
             cert_reqs=ssl.CERT_NONE,
             tls_version=ssl.PROTOCOL_TLS,
         )
         client.tls_insecure_set(True)
         client.username_pw_set(username=username, password=password)
-        client.connected_flag = False
-        return client
 
-    async def _connect(self, username: str, password: str) -> mqtt.Client:
-        """Connect the MQTT client asynchronously."""
-        client = self._create_client(username, password)
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
+        client.on_subscribe = self._on_subscribe
+        client.on_publish = self._on_publish
 
-        def on_connect(c, _u, _f, rc):
-            c.connected_flag = (rc == 0)
-            if rc == 0:
-                _LOGGER.debug("Connected to MQTT on %s", self.tv_ip)
-            else:
-                _LOGGER.error("MQTT connect failed rc=%s", rc)
+        if self.debug:
+            client.enable_logger(logger)
 
-        client.on_connect = on_connect
-        self._client = client
-        client.connect_async(self.tv_ip, 36669, 60)
-        client.loop_start()
-
-        for _ in range(30):  # ~15s timeout
-            if client.connected_flag:
-                return client
-            await asyncio.sleep(0.5)
-
-        await self.disconnect()
-        raise ConnectionError(f"Failed to connect to {self.tv_ip}")
-
-    async def disconnect(self):
-        """Disconnect and stop MQTT loop."""
-        if self._client:
-            self._client.loop_stop()
-            self._client.disconnect()
-            _LOGGER.debug("Disconnected from MQTT.")
-            self._client = None
-
-    # ------------------------------------------------------------------
-    # Credentials handling
-    # ------------------------------------------------------------------
-
-    def apply_credentials(self, credentials: dict):
-        """Store credentials in memory."""
-        self.client_id = credentials.get("client_id")
-        self.username = credentials.get("username")
-        self.password = credentials.get("password")
-        self.accesstoken = credentials.get("accesstoken")
-        self.accesstoken_time = credentials.get("accesstoken_time")
-        self.accesstoken_duration_day = credentials.get("accesstoken_duration_day")
-        self.refreshtoken = credentials.get("refreshtoken")
-        self.refreshtoken_time = credentials.get("refreshtoken_time")
-        self.refreshtoken_duration_day = credentials.get("refreshtoken_duration_day")
-        self._authenticated = True
-        _LOGGER.debug("Credentials applied in memory for %s", self.client_id)
-
-    def _token_valid(self) -> bool:
-        try:
-            now = time.time()
-            exp = int(self.accesstoken_time) + int(self.accesstoken_duration_day) * 86400
-            return now <= exp
-        except Exception:
-            return False
-
-    async def async_ensure_token(self):
-        """Ensure we have a valid token (refresh not implemented yet)."""
-        if self._token_valid():
-            return
-        _LOGGER.warning("Access token invalid or expired. Re-authentication required.")
-
-    # ------------------------------------------------------------------
-    # Public API methods (for HA)
-    # ------------------------------------------------------------------
-
-    async def async_get_state(self) -> Optional[dict]:
-        """Retrieve current TV state."""
-        if not self._authenticated:
-            _LOGGER.warning("Not authenticated, cannot get state.")
-            return None
-
-        await self.async_ensure_token()
-        await self._connect(self.username, self.accesstoken)
-
-        paths = self._topic_paths()
-        topic_sub = paths["brcs"] + "ui_service/state"
-        topic_pub = paths["tv_ui"] + "actions/gettvstate"
-
-        payload_box = {"data": None}
-
-        def on_state(_c, _u, msg):
-            try:
-                payload_box["data"] = json.loads(msg.payload.decode("utf-8"))
-            except Exception as e:
-                _LOGGER.error("Malformed state payload: %s", e)
-
-        self._client.message_callback_add(topic_sub, on_state)
-        self._client.subscribe(topic_sub)
-        self._client.publish(topic_pub, None)
-
-        for _ in range(20):  # 10s max
-            if payload_box["data"] is not None:
-                break
-            await asyncio.sleep(0.5)
-
-        await self.disconnect()
-        return payload_box["data"]
-
-    async def async_send_key(self, key: str) -> None:
-        """Send remote key to TV."""
-        await self.async_ensure_token()
-        await self._connect(self.username, self.accesstoken)
-
-        topic = self._topic_paths()["remo"] + "actions/sendkey"
-        _LOGGER.debug("Sending key %s", key)
-        self._client.publish(topic, key)
-        await asyncio.sleep(0.2)
-        await self.disconnect()
-
-    async def async_set_volume(self, volume: int) -> None:
-        """Change TV volume (0–100)."""
-        await self.async_ensure_token()
-        await self._connect(self.username, self.accesstoken)
-
-        topic = self._topic_paths()["tv_ps"] + "actions/changevolume"
-        _LOGGER.debug("Setting volume to %s", volume)
-        self._client.publish(topic, str(volume))
-        await asyncio.sleep(0.2)
-        await self.disconnect()
-
-    async def async_turn_on(self) -> None:
-        """Power on TV (if off)."""
-        state = await self.async_get_state()
-        if not state or state.get("statetype") == "fake_sleep_0":
-            _LOGGER.debug("TV appears off; sending POWER key to turn on.")
-            await self.async_send_key("KEY_POWER")
-        else:
-            _LOGGER.debug("TV already on; skipping power on.")
-
-    async def async_turn_off(self) -> None:
-        """Power off TV (if on)."""
-        state = await self.async_get_state()
-        if state and state.get("statetype") != "fake_sleep_0":
-            _LOGGER.debug("TV appears on; sending POWER key to turn off.")
-            await self.async_send_key("KEY_POWER")
-        else:
-            _LOGGER.debug("TV already off; skipping power off.")
-
-    async def async_change_source(self, source_id: str) -> None:
-        """Switch input source."""
-        state = await self.async_get_state()
-        if not state or state.get("statetype") == "fake_sleep_0":
-            _LOGGER.info("TV off; cannot change source.")
-            return
-
-        await self.async_ensure_token()
-        await self._connect(self.username, self.accesstoken)
-        topic = self._topic_paths()["tv_ui"] + "actions/changesource"
-        self._client.publish(topic, json.dumps({"sourceid": source_id}))
-        _LOGGER.debug("Changed source to %s", source_id)
-        await asyncio.sleep(0.2)
-        await self.disconnect()
-
-    async def async_launch_app(self, app_id: str, app_name: str, url: str) -> None:
-        """Launch app on TV."""
-        state = await self.async_get_state()
-        if not state or state.get("statetype") == "fake_sleep_0":
-            _LOGGER.info("TV off; cannot launch app.")
-            return
-
-        await self.async_ensure_token()
-        await self._connect(self.username, self.accesstoken)
-        topic = self._topic_paths()["tv_ui"] + "actions/launchapp"
-        payload = json.dumps({"appId": app_id, "name": app_name, "url": url})
-        self._client.publish(topic, payload)
-        _LOGGER.debug("Launched app %s", app_name)
-        await asyncio.sleep(0.2)
-        await self.disconnect()
-
-
-    async def async_start_pairing(self) -> bool:
-        """
-        Begin pairing process with TV.
-        Connects to MQTT, sends app_connect message.
-        TV should display a 4-digit code.
-        Returns True if code prompt shown on TV.
-        """
-        self.define_hashes()
-        self.define_topic_paths()
-
-        client = self.create_mqtt_client(
-            client_id=self.client_id,
-            certfile=None,  # not used, handled inside
-            keyfile=None,
-            username=self.username,
-            password=self.password,
-        )
-        self._pairing_client = client
-        self._authentication_payload = None
-
-        def on_auth(c, _u, msg):
-            try:
-                payload = msg.payload.decode()
-                _LOGGER.debug("Authentication message received: %s", payload)
-                self._authentication_payload = payload
-            except Exception as e:
-                _LOGGER.error("Error parsing authentication payload: %s", e)
-
-        topic_base = f"/remoteapp/mobile/{self.client_id}/"
-        topic_tvui = f"/remoteapp/tv/ui_service/{self.client_id}/"
-        client.message_callback_add(topic_base + "ui_service/data/authentication", on_auth)
-
-        client.connect_async(self.tv_ip, 36669, 60)
-        client.loop_start()
-
-        # Wait for MQTT connection
-        for _ in range(30):
-            if getattr(client, "connected_flag", False):
-                break
-            await asyncio.sleep(0.2)
-        if not getattr(client, "connected_flag", False):
-            _LOGGER.error("Could not connect to TV at %s", self.tv_ip)
-            return False
-
-        client.subscribe(topic_base + "ui_service/data/authentication")
-        client.publish(topic_tvui + "actions/vidaa_app_connect", json.dumps({
-            "app_version": 2,
-            "connect_result": 0,
-            "device_type": "Mobile App"
-        }))
-
-        # Wait for TV to respond and show pairing code
-        _LOGGER.info("Waiting for TV to show pairing code...")
-        for _ in range(60):
-            if self._authentication_payload is not None:
-                break
-            await asyncio.sleep(0.5)
-
-        if self._authentication_payload is None:
-            _LOGGER.error("No pairing response received from TV.")
-            await self._disconnect_pairing()
-            return False
-
-        _LOGGER.info("TV should now show a 4-digit code. Awaiting user input in HA config flow.")
-        return True
-
-    async def async_finish_pairing(self, auth_code: str) -> dict:
-        """
-        Complete the pairing process by sending the 4-digit auth code.
-        Returns credentials dict (tokens etc.)
-        """
-        client = getattr(self, "_pairing_client", None)
-        if not client:
-            raise RuntimeError("Pairing not started")
-
-        topic_base = f"/remoteapp/mobile/{self.client_id}/"
-        topic_tvui = f"/remoteapp/tv/ui_service/{self.client_id}/"
-        topic_ps = f"/remoteapp/tv/platform_service/{self.client_id}/"
-
-        tokenissuance_event = asyncio.Event()
-        credentials_box = {}
-
-        def on_tokenissuance(_c, _u, msg):
-            try:
-                payload = json.loads(msg.payload.decode())
-                _LOGGER.debug("Token issuance received: %s", payload)
-                credentials_box.update(payload)
-                tokenissuance_event.set()
-            except Exception as e:
-                _LOGGER.error("Error parsing token issuance: %s", e)
-
-        client.message_callback_add(topic_base + "platform_service/data/tokenissuance", on_tokenissuance)
-
-        # Subscribe to topics
-        client.subscribe(topic_base + "ui_service/data/authenticationcode")
-        client.subscribe(topic_base + "platform_service/data/tokenissuance")
-
-        # Send the code
-        _LOGGER.info("Sending 4-digit auth code to TV: %s", auth_code)
-        client.publish(topic_tvui + "actions/authenticationcode", json.dumps({"authNum": auth_code}))
-
-        # Wait for token issuance
-        try:
-            await asyncio.wait_for(tokenissuance_event.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            _LOGGER.error("Timeout waiting for token issuance from TV.")
-            await self._disconnect_pairing()
-            raise
-
-        # Apply credentials and close connection
-        credentials_box.update({
-            "client_id": self.client_id,
-            "username": self.username,
-            "password": self.password,
-        })
-
-        self.apply_credentials(credentials_box)
-        _LOGGER.info("Pairing successful, credentials received.")
-        await self._disconnect_pairing()
-        return credentials_box
-
-    async def _disconnect_pairing(self):
-        """Disconnect the temporary pairing MQTT client."""
-        client = getattr(self, "_pairing_client", None)
-        if client:
-            try:
-                client.loop_stop()
-                client.disconnect()
-            except Exception:
-                pass
-            self._pairing_client = None
-
-    def create_mqtt_client(self, client_id, certfile=None, keyfile=None, username=None, password=None, userdata=None):
-        client = mqtt.Client(client_id=client_id, clean_session=True, userdata=userdata, protocol=mqtt.MQTTv311, transport="tcp")
-
-        # Schreibe die Zertifikate temporär in Dateien, da paho-mqtt keine Strings akzeptiert
-        tmp_cert = tempfile.NamedTemporaryFile(delete=False)
-        tmp_key = tempfile.NamedTemporaryFile(delete=False)
-        tmp_cert.write(hisense_cert.encode("utf-8"))
-        tmp_key.write(hisense_key.encode("utf-8"))
-        tmp_cert.flush()
-        tmp_key.flush()
-
-        client.tls_set(
-            ca_certs=None,
-            certfile=tmp_cert.name,
-            keyfile=tmp_key.name,
-            cert_reqs=ssl.CERT_NONE,
-            tls_version=ssl.PROTOCOL_TLS
-        )
-        client.tls_insecure_set(True)
-
-        client.username_pw_set(username=username, password=password)
-
-        client.on_connect = self.on_connect
-        client.on_message = self.on_message
-        client.on_disconnect = self.on_disconnect
-
+        # Custom Flags
         client.connected_flag = False
         client.cancel_loop = False
         return client
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            client.connected_flag = True
+            self._connected_evt.set()
+            logger.info("Connected to MQTT broker")
+        else:
+            logger.error(f"Bad connection. Returned code: {rc}")
+            client.cancel_loop = True
+
+    def _on_disconnect(self, client, userdata, rc):
+        logger.info(f"Disconnected. Reason: {rc}")
+        self._connected_evt.clear()
+
+    def _on_subscribe(self, client, userdata, mid, granted_qos):
+        logger.debug(f"Subscribed: {mid} {granted_qos}")
+
+    def _on_publish(self, client, userdata, mid):
+        logger.debug(f"Published message {mid}")
+
+    def _on_message(self, client, userdata, msg):
+        payload = msg.payload.decode("utf-8") if isinstance(msg.payload, (bytes, bytearray)) else str(msg.payload)
+        logger.debug(f"[MQTT] {msg.topic} -> {payload}")
+
+        fut = self._topic_waiters.get(msg.topic)
+        if fut and not fut.done():
+            fut.set_result(payload)
+
+    async def ensure_connected(self, username: str, password: str, client_id: str) -> None:
+        """
+        Erstellt (falls nötig) den Client, startet loop und wartet bis verbunden.
+        """
+        if self.client is None:
+            self.client = self._build_client(client_id=client_id, username=username, password=password)
+            self.client.loop_start()
+            self.client.connect_async(self.tv_ip, 36669, 60)
+
+        if not self._connected_evt.is_set():
+            try:
+                await asyncio.wait_for(self._connected_evt.wait(), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                raise RuntimeError("Timeout while connecting to MQTT broker")
+
+    async def _subscribe(self, topic: str, qos: int = 0) -> None:
+        async with self._lock:
+            if topic in self._subscriptions:
+                return
+            assert self.client is not None
+            res = self.client.subscribe(topic, qos)
+            if res[0] != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError(f"Failed to subscribe {topic}: code {res[0]}")
+            self._subscriptions.add(topic)
+
+    async def _publish(self, topic: str, payload: Optional[str]) -> None:
+        async with self._lock:
+            assert self.client is not None
+            res = self.client.publish(topic, payload)
+            if res.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError(f"Failed to publish to {topic}: code {res.rc}")
+
+    async def _await_topic_once(self, topic: str, *, timeout: Optional[float] = None) -> str:
+        """
+        Wartet auf die nächste Nachricht zu `topic` und liefert deren (decoded) Payload zurück.
+        """
+        if topic in self._topic_waiters and not self._topic_waiters[topic].done():
+            # Bestehenden Waiter abbrechen, um keine Leaks zu erzeugen
+            self._topic_waiters[topic].cancel()
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._topic_waiters[topic] = fut
+
+        await self._subscribe(topic)
+        try:
+            payload = await asyncio.wait_for(fut, timeout=timeout or self.timeout)
+            return payload
+        finally:
+            # Clean-up: diesen Waiter verwerfen
+            self._topic_waiters.pop(topic, None)
+
+    # --------------------------
+    # Hashes / Topics
+    # --------------------------
+
+    def _define_hashes(self, *, new_auth: bool = False) -> None:
+        self.timestamp = int(time.time())
+
+        if self.random_mac:
+            mac = random_mac_address()
+        else:
+            mac = ":".join(re.findall("..", f"{uuid.getnode():012x}")).upper()
+
+        logger.info(f"MAC Address: {mac}")
+
+        first_hash = string_to_hash("&vidaa#^app")
+        second_hash = string_to_hash(f"38D65DC30F45109A369A86FCE866A85B${mac}")
+        last_digit_of_cross = cross_sum(self.timestamp) % 10
+        third_hash = string_to_hash(f"his{last_digit_of_cross}h*i&s%e!r^v0i1c9")
+        fourth_hash = string_to_hash(f"{self.timestamp}${third_hash[:6]}")
+
+        if new_auth:
+            self.username = f"his${self.timestamp ^ 6239759785777146216}"
+        else:
+            self.username = f"his${self.timestamp}"
+
+        self.password = fourth_hash
+        self.client_id = f"{mac}$his${second_hash[:6]}_vidaacommon_001"
+
+        if self.debug:
+            logger.debug(f"First Hash: {first_hash}")
+            logger.debug(f"Second Hash: {second_hash}")
+            logger.debug(f"Third Hash: {third_hash}")
+            logger.debug(f"Fourth Hash: {fourth_hash}")
+            logger.debug(f"Client ID: {self.client_id}")
+
+    def _define_topic_paths(self) -> None:
+        assert self.client_id is not None
+        self.topicTVUIBasepath = f"/remoteapp/tv/ui_service/{self.client_id}/"
+        self.topicTVPSBasepath = f"/remoteapp/tv/platform_service/{self.client_id}/"
+        self.topicMobiBasepath = f"/remoteapp/mobile/{self.client_id}/"
+        self.topicBrcsBasepath = "/remoteapp/mobile/broadcast/"
+        self.topicRemoBasepath = f"/remoteapp/tv/remote_service/{self.client_id}/"
+
+    # --------------------------
+    # Auth & Token
+    # --------------------------
+
+    async def request_auth_code(self, *, new_auth: bool = False) -> None:
+        """
+        Startet den Authentifizierungsprozess und zeigt den vierstelligen Code auf dem TV an.
+        Diese Methode führt KEINE Codeeingabe durch.
+        """
+        self._define_hashes(new_auth=new_auth)
+        self._define_topic_paths()
+        assert self.username and self.password and self.client_id
+
+        await self.ensure_connected(self.username, self.password, self.client_id)
+
+        auth_topic = f"{self.topicMobiBasepath}ui_service/data/authentication"
+        await self._publish(self.topicTVUIBasepath + "actions/vidaa_app_connect",
+                            '{"app_version":2,"connect_result":0,"device_type":"Mobile App"}')
+
+        payload = await self._await_topic_once(auth_topic)
+        if payload.strip() != '""':
+            raise RuntimeError(f"Unexpected authentication payload: {payload}")
+
+        logger.info("Authentication request sent. The TV should now display a 4-digit code.")
+
+    async def verify_auth_code(self, auth_code: str) -> str:
+        """
+        Sendet den 4-stelligen Code, wartet auf Bestätigung und erhält anschließend Tokens.
+        Gibt den Access Token zurück.
+        """
+        assert self.client_id and self.username and self.password
+
+        auth_code_topic = f"{self.topicMobiBasepath}ui_service/data/authenticationcode"
+        token_topic = f"{self.topicMobiBasepath}platform_service/data/tokenissuance"
+
+        code = str(auth_code).strip()
+        await self._publish(self.topicTVUIBasepath + "actions/authenticationcode", f'{{"authNum":{code}}}')
+
+        msg = await self._await_topic_once(auth_code_topic)
+        try:
+            obj = json.loads(msg)
+        except json.JSONDecodeError:
+            obj = {}
+
+        if obj.get("result") != 1:
+            raise RuntimeError(f"Authentication failed: {msg}")
+
+        logger.info("Authentication code verified. Requesting access token...")
+
+        await self._publish(self.topicTVPSBasepath + "data/gettoken", '{"refreshtoken": ""}')
+        await self._publish(self.topicTVUIBasepath + "actions/authenticationcodeclose", None)
+
+        token_payload = await self._await_topic_once(token_topic)
+        credentials = json.loads(token_payload)
+        credentials.update({"client_id": self.client_id, "username": self.username, "password": self.password})
+
+        self._apply_credentials(credentials)
+        self.authenticated = True
+        logger.info("Token issued successfully")
+
+        return self.accesstoken  # type: ignore
+
+
+    async def generate_creds(
+        self,
+        *,
+        auth_code_provider: Optional[Callable[[], Awaitable[str] | str]] = None,
+        new_auth: bool = False,
+    ) -> str:
+        """
+        Komfortfunktion: führt request_auth_code() + verify_auth_code() in einem Schritt aus.
+        """
+        await self.request_auth_code(new_auth=new_auth)
+
+        if auth_code_provider is None:
+            def _sync_input():
+                return input("Enter the four digits displayed on your TV: ").strip()
+            auth_code_provider = _sync_input  # type: ignore
+
+        code = auth_code_provider()
+        if asyncio.iscoroutine(code):
+            code = await code  # type: ignore
+
+        return await self.verify_auth_code(str(code))
+
+
+    async def refresh_token(self) -> str:
+        """
+        Token-Refresh via refreshtoken (als MQTT-Passwort).
+        """
+        assert self.client_id and self.username and self.refreshtoken
+        # Neu verbinden mit refreshtoken als Passwort
+        await self.ensure_connected(self.username, self.refreshtoken, self.client_id)
+
+        token_topic = f"{self.topicMobiBasepath}platform_service/data/tokenissuance"
+        await self._publish(f"/remoteapp/tv/platform_service/{self.client_id}/data/gettoken",
+                            json.dumps({"refreshtoken": self.refreshtoken}))
+
+        payload = await self._await_topic_once(token_topic)
+        credentials = json.loads(payload)
+        credentials.update({"client_id": self.client_id, "username": self.username, "password": self.password})
+        logger.info("Token refreshed successfully")
+
+        self._apply_credentials(credentials)
+        self.authenticated = True
+        return self.accesstoken  # type: ignore
+
+    async def check_and_refresh_token(self) -> str:
+        """
+        Prüft Gültigkeit des Access Tokens und refreshed falls nötig.
+        """
+        assert self.accesstoken and self.accesstoken_time and self.accesstoken_duration_day
+        now = time.time()
+        exp = self.accesstoken_time + (self.accesstoken_duration_day * 24 * 60 * 60)
+
+        if now <= exp:
+            if self.debug:
+                left = int(exp - now)
+                days = left // 86400
+                hours = (left % 86400) // 3600
+                minutes = (left % 3600) // 60
+                seconds = left % 60
+                logger.debug(f"Access token valid for {days}d {hours}h {minutes}m {seconds}s")
+            return self.accesstoken
+        logger.info("Access token expired, refreshing...")
+        return await self.refresh_token()
+
+    async def connect_with_access_token(self) -> None:
+        """
+        Verbindet den MQTT-Client mit dem aktuellen Access Token (falls bereits vorhanden).
+        """
+        assert self.username and self.client_id and self.accesstoken
+        await self.ensure_connected(self.username, self.accesstoken, self.client_id)
+
+    # --------------------------
+    # High-level Info/Commands
+    # --------------------------
+
+    async def _get_info(self, *, callback_topic: str, subscribe_topic: str, publish_topic: str) -> Optional[dict]:
+        # Stelle sicher, dass wir mit Access Token verbunden sind (oder refreshen)
+        if self.accesstoken:
+            await self.check_and_refresh_token()
+            await self.connect_with_access_token()
+        else:
+            raise RuntimeError("Not authenticated. Call generate_creds() first.")
+
+        await self._subscribe(subscribe_topic)
+        # Manche Endpunkte erfordern zusätzlich die Auth-Error-Topic-Subscription; hier reicht i. d. R. das Zieltopic.
+
+        await self._publish(publish_topic, None)
+        payload = await self._await_topic_once(callback_topic)
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse info payload from {callback_topic}: {payload}")
+            return None
+
+    async def _send_command(self, *, publish_topic: str, command: Optional[str]) -> None:
+        if self.accesstoken:
+            await self.check_and_refresh_token()
+            await self.connect_with_access_token()
+        else:
+            raise RuntimeError("Not authenticated. Call generate_creds() first.")
+        await self._publish(publish_topic, command)
+
+    # Public API
+
+    async def get_tv_state(self) -> Optional[dict]:
+        callback = f"{self.topicBrcsBasepath}ui_service/state"
+        subscribe = callback
+        publish = f"{self.topicTVUIBasepath}actions/gettvstate"
+        return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)
+
+    async def get_source_list(self) -> Optional[list]:
+        callback = f"{self.topicMobiBasepath}ui_service/data/sourcelist"
+        subscribe = callback
+        publish = f"{self.topicTVUIBasepath}actions/sourcelist"
+        return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)  # type: ignore
+
+    async def get_volume(self) -> Optional[dict]:
+        callback = f"{self.topicBrcsBasepath}platform_service/actions/volumechange"
+        subscribe = callback
+        publish = f"{self.topicTVPSBasepath}actions/getvolume"
+        return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)
+
+    async def get_app_list(self) -> Optional[list]:
+        callback = f"{self.topicMobiBasepath}ui_service/data/applist"
+        subscribe = callback
+        publish = f"{self.topicTVUIBasepath}actions/applist"
+        return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)  # type: ignore
+
+    async def power_cycle_tv(self) -> None:
+        publish = f"{self.topicRemoBasepath}actions/sendkey"
+        await self._send_command(publish_topic=publish, command="KEY_POWER")
+
+    async def send_key(self, key: str) -> bool:
+        state = await self.get_tv_state()
+        if not state:
+            logger.error("Failed to get TV state.")
+            return False
+        if state.get("statetype") == "fake_sleep_0":
+            logger.info("TV is off. Not sending key...")
+            return False
+        publish = f"{self.topicRemoBasepath}actions/sendkey"
+        await self._send_command(publish_topic=publish, command=key)
+        return True
+
+    async def change_source(self, source_id: str | int) -> bool:
+        state = await self.get_tv_state()
+        if not state:
+            logger.error("Failed to get TV state.")
+            return False
+        if state.get("statetype") == "fake_sleep_0":
+            logger.info("TV is off. Not changing source...")
+            return False
+        publish = f"{self.topicTVUIBasepath}actions/changesource"
+        cmd = json.dumps({"sourceid": source_id})
+        await self._send_command(publish_topic=publish, command=cmd)
+        return True
+
+    async def change_volume(self, volume: int) -> bool:
+        state = await self.get_tv_state()
+        if not state:
+            logger.error("Failed to get TV state.")
+            return False
+        if state.get("statetype") == "fake_sleep_0":
+            logger.info("TV is off. Not changing volume...")
+            return False
+        publish = f"{self.topicTVPSBasepath}actions/changevolume"
+        await self._send_command(publish_topic=publish, command=str(volume))
+        return True
+
+    async def launch_app(self, app_name: str, app_list: Optional[list] = None) -> bool:
+        if not app_list:
+            app_list = await self.get_app_list()
+            if not app_list:
+                logger.error("Failed to get app list.")
+                return False
+
+        app_id = None
+        app_url = None
+        resolved_name = app_name
+        for app in app_list:
+            if app.get("name", "").upper() == app_name.upper():
+                app_id = app.get("appId")
+                app_url = app.get("url")
+                resolved_name = app.get("name", app_name)
+                break
+
+        if not app_id or not app_url:
+            logger.error("Failed to find app in app list.")
+            return False
+
+        state = await self.get_tv_state()
+        if not state:
+            logger.error("Failed to get TV state.")
+            return False
+        if state.get("statetype") == "fake_sleep_0":
+            logger.info("TV is off. Not launching app...")
+            return False
+
+        publish = f"{self.topicTVUIBasepath}actions/launchapp"
+        cmd = json.dumps({"appId": app_id, "name": resolved_name, "url": app_url})
+        await self._send_command(publish_topic=publish, command=cmd)
+        return True
+
+
+    async def turn_on(self):
+        tv_state = await self.get_tv_state()
+        if tv_state:
+            if "statetype" in tv_state and tv_state["statetype"] == "fake_sleep_0":
+                # Power cycle the TV
+                command_sent = self.power_cycle_tv()
+                if command_sent:
+                    logger.info("Power cycle command sent.")
+                else:
+                    logger.error("Failed to send power cycle command.")
+            else:
+                logger.info("TV is already on.")
+        else:
+            logger.error("Failed to get TV state.")
+
+    async def turn_off(self):
+        tv_state = await self.get_tv_state()
+        if tv_state:
+            if "statetype" in tv_state and tv_state["statetype"] != "fake_sleep_0":
+                # Power cycle the TV
+                command_sent = self.power_cycle_tv()
+                if command_sent:
+                    logger.info("Power cycle command sent.")
+                else:
+                    logger.error("Failed to send power cycle command.")
+            else:
+                logger.info("TV is already off.")
+        else:
+            logger.error("Failed to get TV state.")
+
+
+    # --------------------------
+    # Utilities
+    # --------------------------
+
+    def credentials_summary(self) -> dict:
+        return {
+            "client_id": self.client_id,
+            "username": self.username,
+            "password": self.password,
+            "accesstoken": self.accesstoken,
+            "accesstoken_time": self.accesstoken_time,
+            "accesstoken_duration_day": self.accesstoken_duration_day,
+            "refreshtoken": self.refreshtoken,
+            "refreshtoken_time": self.refreshtoken_time,
+            "refreshtoken_duration_day": self.refreshtoken_duration_day,
+        }

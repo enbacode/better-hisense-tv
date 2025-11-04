@@ -33,16 +33,13 @@ class BetterHisenseTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._ip = ip
 
             # initialize controller
-            controller = HisenseTVController(ip)
+            controller = HisenseTVController(ip, certfile="./../certchain_pem.cer", keyfile="./../rcm_pem_privkey.pkcs8")
             self._controller = controller
 
             try:
                 _LOGGER.debug("Starting pairing with Hisense TV at %s", ip)
-                code_needed = await controller.async_start_pairing()
-                if code_needed:
-                    return await self.async_step_authcode()
-                else:
-                    errors["base"] = "pairing_failed"
+                await controller.request_auth_code()
+                return await self.async_step_authcode()
             except Exception as e:
                 _LOGGER.error("Failed to connect to TV at %s: %s", ip, e)
                 errors["base"] = "connection_failed"
@@ -61,16 +58,18 @@ class BetterHisenseTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             auth_code = user_input["auth_code"]
 
             try:
-                credentials = await self._controller.async_finish_pairing(auth_code)
-                if credentials:
-                    return self.async_create_entry(
+                await self._controller.verify_auth_code(auth_code)
+                return self.async_create_entry(
                         title=f"Hisense TV ({self._ip})",
                         data={
                             "ip": self._ip,
-                            "credentials": credentials,
+                            "credentials": {
+                                "client_id": self._controller.client_id,
+                                "username": self._controller.username,
+                                "password": self._controller.password
+                            },
                         },
                     )
-                errors["base"] = "auth_failed"
             except Exception as e:
                 _LOGGER.error("Authentication failed: %s", e)
                 errors["base"] = "auth_failed"
@@ -98,7 +97,7 @@ class BetterHisenseTVOptionsFlow(config_entries.OptionsFlow):
             data = self.config_entry.data.copy()
             data["ip"] = user_input["ip"]
             return self.async_create_entry(title="", data=data)
-
+            
         schema = vol.Schema({
             vol.Required("ip", default=self.config_entry.data.get("ip", "")): str,
         })

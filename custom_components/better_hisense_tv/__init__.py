@@ -19,12 +19,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     credentials = entry.data["credentials"]  # dict from config_flow or YAML
 
     controller = HisenseTVController(ip)
-    controller.apply_credentials(credentials)
+    controller.client_id = credentials.get("client_id")
+    controller.username = credentials.get("username")
+    controller.password = credentials.get("password")
+    await controller.ensure_connected(controller.username, controller.password, controller.client_id)
 
     async def async_update_data():
         """Fetch TV state periodically."""
         try:
-            state = await controller.async_get_state()
+            state = await controller.get_tv_state()
             return state or {}
         except Exception as err:
             _LOGGER.warning("Failed to update Hisense TV state: %s", err)

@@ -8,6 +8,8 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNKNOWN, ATTR_ATTRIBUTION
 
+from custom_components.better_hisense_tv.tv_controller import HisenseTVController
+
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -31,7 +33,7 @@ class HisenseTVEntity(MediaPlayerEntity):
         | MediaPlayerEntityFeature.VOLUME_SET
     )
 
-    def __init__(self, controller, coordinator):
+    def __init__(self, controller: HisenseTVController, coordinator):
         self._controller = controller
         self._coordinator = coordinator
         self._attr_unique_id = controller.client_id or "hisense_tv"
@@ -39,6 +41,7 @@ class HisenseTVEntity(MediaPlayerEntity):
         self._volume = None
 
     async def async_update(self):
+        self._coordinator.data = await self._controller.get_tv_state()
         await self._coordinator.async_request_refresh()
 
     @property
@@ -53,26 +56,27 @@ class HisenseTVEntity(MediaPlayerEntity):
         return self._state
 
     @property
-    def volume_level(self) -> float | None:
-        """Return the current volume (0.0–1.0)."""
+    def volume_level(self) -> int | None:
+        """Return the current volume (0–100)."""
         if self._volume is not None:
             return self._volume
         return None
 
     async def async_turn_on(self):
         _LOGGER.debug("Turning on Hisense TV")
-        await self._controller.async_turn_on()
+        await self._controller.turn_on()
+        self._coordinator.data = await self._controller.get_tv_state()
         await self._coordinator.async_request_refresh()
 
     async def async_turn_off(self):
         _LOGGER.debug("Turning off Hisense TV")
-        await self._controller.async_turn_off()
+        await self._controller.turn_off()
+        self._coordinator.data = await self._controller.get_tv_state()
         await self._coordinator.async_request_refresh()
 
-    async def async_set_volume_level(self, volume: float):
-        """Set the volume level (0.0–1.0)."""
-        level = int(volume * 100)
-        await self._controller.async_set_volume(level)
+    async def async_set_volume_level(self, volume: int):
+        """Set the volume level (0–100)."""
+        await self._controller.change_volume(volume)
         self._volume = volume
         await self._coordinator.async_request_refresh()
 
@@ -81,4 +85,7 @@ class HisenseTVEntity(MediaPlayerEntity):
         return {
             ATTR_ATTRIBUTION: "Better Hisense TV integration",
             "client_id": self._controller.client_id,
+            "username": self._controller.username,
+            "ip_address": self._controller.ip,
+            "password": self._controller.password,
         }
