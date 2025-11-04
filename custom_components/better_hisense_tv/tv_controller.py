@@ -1,12 +1,48 @@
 """
 tvcontroller.py — VIDAa/Hisense TV MQTT Controller (async, persistent client)
-FIXED VERSION
+
+Beispielnutzung:
+
+    import asyncio
+    from tvcontroller import TVAuthenticator
+
+    async def main():
+        auth = TVAuthenticator(
+            tv_ip="192.168.178.25",
+            certfile="./rcm_certchain_pem.cer",
+            keyfile="./rcm_pem_privkey.pkcs8",
+            random_mac=True,
+            debug=True,
+        )
+
+        # 1) Erst-Authentifizierung (nur einmal nötig). Danach hast du Tokens.
+        #    Falls bereits Tokens vorliegen, kannst du direkt auth.connect_with_access_token() nutzen.
+        async def prompt_code():
+            # Eingabe 4-stelliger Code vom TV
+            return input("Enter the four digits displayed on your TV: ").strip()
+
+        await auth.generate_creds(auth_code_provider=prompt_code)
+        print("Credentials:", auth.credentials_summary())
+
+        # 2) State abrufen
+        state = await auth.get_tv_state()
+        print("TV State:", state)
+
+        # 3) Taste senden
+        await auth.send_key("KEY_POWER")
+
+        # 4) Volume ändern (Beispiel)
+        await auth.change_volume(12)
+
+    if __name__ == "__main__":
+        asyncio.run(main())
 """
 
 import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import ssl
@@ -16,10 +52,19 @@ from typing import Callable, Awaitable, Optional, Dict, Any
 
 import paho.mqtt.client as mqtt
 
+
+# ---------------------------------------------------------------------------
+# Konfiguration & Logging
+# ---------------------------------------------------------------------------
+
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("tvcontroller")
 
+
+# ---------------------------------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------------------------------
 
 def cross_sum(n: int) -> int:
     return sum(int(d) for d in str(n))
@@ -32,6 +77,10 @@ def string_to_hash(s: str) -> str:
 def random_mac_address() -> str:
     return ":".join(f"{random.randint(0, 255):02x}" for _ in range(6))
 
+
+# ---------------------------------------------------------------------------
+# TVAuthenticator
+# ---------------------------------------------------------------------------
 
 class HisenseTVController:
     """
@@ -50,6 +99,7 @@ class HisenseTVController:
         timeout: float = 60.0,
         debug: bool = False,
     ) -> None:
+        # Basis
         self.tv_ip = tv_ip
         self.certfile = certfile
         self.keyfile = keyfile
@@ -58,12 +108,14 @@ class HisenseTVController:
         self.timeout = timeout
         self.debug = debug
 
+        # MQTT
         self.client: Optional[mqtt.Client] = None
         self._connected_evt = asyncio.Event()
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # serialisiert publish / subscribe
         self._topic_waiters: Dict[str, asyncio.Future] = {}
         self._subscriptions: set[str] = set()
 
+        # Credentials/State
         self.reply = None
         self.authentication_payload = None
         self.authentication_code_payload = None
@@ -84,11 +136,16 @@ class HisenseTVController:
         self.timestamp: Optional[int] = None
         self.authenticated: bool = False
 
+        # Topic-Basen
         self.topicTVUIBasepath: Optional[str] = None
         self.topicTVPSBasepath: Optional[str] = None
         self.topicMobiBasepath: Optional[str] = None
         self.topicBrcsBasepath: Optional[str] = None
         self.topicRemoBasepath: Optional[str] = None
+
+    # --------------------------
+    # MQTT low-level
+    # --------------------------
 
     def _build_client(self, client_id: str, username: str, password: str) -> mqtt.Client:
         client = mqtt.Client(client_id=client_id, clean_session=True, protocol=mqtt.MQTTv311, transport="tcp")
@@ -111,6 +168,7 @@ class HisenseTVController:
         if self.debug:
             client.enable_logger(logger)
 
+        # Custom Flags
         client.connected_flag = False
         client.cancel_loop = False
         return client
@@ -179,6 +237,7 @@ class HisenseTVController:
         Wartet auf die nächste Nachricht zu `topic` und liefert deren (decoded) Payload zurück.
         """
         if topic in self._topic_waiters and not self._topic_waiters[topic].done():
+            # Bestehenden Waiter abbrechen, um keine Leaks zu erzeugen
             self._topic_waiters[topic].cancel()
 
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -189,7 +248,12 @@ class HisenseTVController:
             payload = await asyncio.wait_for(fut, timeout=timeout or self.timeout)
             return payload
         finally:
+            # Clean-up: diesen Waiter verwerfen
             self._topic_waiters.pop(topic, None)
+
+    # --------------------------
+    # Hashes / Topics
+    # --------------------------
 
     def _define_hashes(self, *, new_auth: bool = False) -> None:
         self.timestamp = int(time.time())
@@ -216,6 +280,10 @@ class HisenseTVController:
         self.client_id = f"{mac}$his${second_hash[:6]}_vidaacommon_001"
 
         if self.debug:
+            logger.debug(f"First Hash: {first_hash}")
+            logger.debug(f"Second Hash: {second_hash}")
+            logger.debug(f"Third Hash: {third_hash}")
+            logger.debug(f"Fourth Hash: {fourth_hash}")
             logger.debug(f"Client ID: {self.client_id}")
 
     def _define_topic_paths(self) -> None:
@@ -226,32 +294,20 @@ class HisenseTVController:
         self.topicBrcsBasepath = "/remoteapp/mobile/broadcast/"
         self.topicRemoBasepath = f"/remoteapp/tv/remote_service/{self.client_id}/"
 
-    def _apply_credentials(self, credentials: dict) -> None:
-        """Helper method to apply credentials"""
-        self.accesstoken = credentials["accesstoken"]
-        self.accesstoken_time = credentials["accesstoken_time"]
-        self.accesstoken_duration_day = credentials["accesstoken_duration_day"]
-        self.refreshtoken = credentials["refreshtoken"]
-        self.refreshtoken_time = credentials["refreshtoken_time"]
-        self.refreshtoken_duration_day = credentials["refreshtoken_duration_day"]
+    # --------------------------
+    # Auth & Token
+    # --------------------------
 
     async def request_auth_code(self, *, new_auth: bool = False) -> None:
         """
-        WICHTIG: Diese Methode allein reicht NICHT für den Auth-Flow!
-        Verwende stattdessen generate_creds() für den kompletten Flow.
+        Startet den Authentifizierungsprozess und zeigt den vierstelligen Code auf dem TV an.
+        Diese Methode führt KEINE Codeeingabe durch.
         """
         self._define_hashes(new_auth=new_auth)
         self._define_topic_paths()
         assert self.username and self.password and self.client_id
 
         await self.ensure_connected(self.username, self.password, self.client_id)
-
-        # Subscribe zu ALLEN notwendigen Topics VOR dem Senden
-        await self._subscribe(f"{self.topicBrcsBasepath}ui_service/state")
-        await self._subscribe(f"{self.topicMobiBasepath}ui_service/data/authentication")
-        await self._subscribe(f"{self.topicMobiBasepath}ui_service/data/authenticationcode")
-        await self._subscribe(f"{self.topicBrcsBasepath}ui_service/data/hotelmodechange")
-        await self._subscribe(f"{self.topicMobiBasepath}platform_service/data/tokenissuance")
 
         auth_topic = f"{self.topicMobiBasepath}ui_service/data/authentication"
         await self._publish(self.topicTVUIBasepath + "actions/vidaa_app_connect",
@@ -265,11 +321,10 @@ class HisenseTVController:
 
     async def verify_auth_code(self, auth_code: str) -> str:
         """
-        WICHTIG: Muss auf demselben Client wie request_auth_code laufen!
-        Die Subscriptions müssen bereits aktiv sein.
+        Sendet den 4-stelligen Code, wartet auf Bestätigung und erhält anschließend Tokens.
+        Gibt den Access Token zurück.
         """
         assert self.client_id and self.username and self.password
-        assert self.client is not None, "Client must be connected via request_auth_code first"
 
         auth_code_topic = f"{self.topicMobiBasepath}ui_service/data/authenticationcode"
         token_topic = f"{self.topicMobiBasepath}platform_service/data/tokenissuance"
@@ -299,7 +354,9 @@ class HisenseTVController:
         self.authenticated = True
         logger.info("Token issued successfully")
 
-        return self.accesstoken
+        return self.accesstoken  # type: ignore
+
+
 
     async def generate_creds(
         self,
@@ -309,38 +366,30 @@ class HisenseTVController:
     ) -> str:
         """
         Komfortfunktion: führt request_auth_code() + verify_auth_code() in einem Schritt aus.
-        EMPFOHLENE METHODE für die Authentifizierung!
         """
         await self.request_auth_code(new_auth=new_auth)
 
         if auth_code_provider is None:
             def _sync_input():
                 return input("Enter the four digits displayed on your TV: ").strip()
-            auth_code_provider = _sync_input
+            auth_code_provider = _sync_input  # type: ignore
 
         code = auth_code_provider()
         if asyncio.iscoroutine(code):
-            code = await code
+            code = await code  # type: ignore
 
         return await self.verify_auth_code(str(code))
 
+
     async def refresh_token(self) -> str:
-        """Token-Refresh via refreshtoken (als MQTT-Passwort)."""
+        """
+        Token-Refresh via refreshtoken (als MQTT-Passwort).
+        """
         assert self.client_id and self.username and self.refreshtoken
-        
-        # Disconnect old client if exists
-        if self.client:
-            self.client.loop_stop()
-            self.client.disconnect()
-            self.client = None
-            self._connected_evt.clear()
-            self._subscriptions.clear()
-        
+        # Neu verbinden mit refreshtoken als Passwort
         await self.ensure_connected(self.username, self.refreshtoken, self.client_id)
 
         token_topic = f"{self.topicMobiBasepath}platform_service/data/tokenissuance"
-        await self._subscribe(token_topic)
-        
         await self._publish(f"/remoteapp/tv/platform_service/{self.client_id}/data/gettoken",
                             json.dumps({"refreshtoken": self.refreshtoken}))
 
@@ -351,13 +400,15 @@ class HisenseTVController:
 
         self._apply_credentials(credentials)
         self.authenticated = True
-        return self.accesstoken
+        return self.accesstoken  # type: ignore
 
     async def check_and_refresh_token(self) -> str:
-        """Prüft Gültigkeit des Access Tokens und refreshed falls nötig."""
+        """
+        Prüft Gültigkeit des Access Tokens und refreshed falls nötig.
+        """
         assert self.accesstoken and self.accesstoken_time and self.accesstoken_duration_day
         now = time.time()
-        exp = self.accesstoken_time + (self.accesstoken_duration_day * 24 * 60 * 60)
+        exp = int(self.accesstoken_time) + (self.accesstoken_duration_day * 24 * 60 * 60)
 
         if now <= exp:
             if self.debug:
@@ -366,26 +417,24 @@ class HisenseTVController:
                 hours = (left % 86400) // 3600
                 minutes = (left % 3600) // 60
                 seconds = left % 60
-                logger.debug(f"Access token valid for {days}d {hours}h {minutes}m {seconds}s")
+                logger.warning(f"Access token valid for {days}d {hours}h {minutes}m {seconds}s")
             return self.accesstoken
         logger.info("Access token expired, refreshing...")
         return await self.refresh_token()
 
     async def connect_with_access_token(self) -> None:
-        """Verbindet den MQTT-Client mit dem aktuellen Access Token."""
+        """
+        Verbindet den MQTT-Client mit dem aktuellen Access Token (falls bereits vorhanden).
+        """
         assert self.username and self.client_id and self.accesstoken
-        
-        # Disconnect old client if exists
-        if self.client:
-            self.client.loop_stop()
-            self.client.disconnect()
-            self.client = None
-            self._connected_evt.clear()
-            self._subscriptions.clear()
-            
         await self.ensure_connected(self.username, self.accesstoken, self.client_id)
 
+    # --------------------------
+    # High-level Info/Commands
+    # --------------------------
+
     async def _get_info(self, *, callback_topic: str, subscribe_topic: str, publish_topic: str) -> Optional[dict]:
+        # Stelle sicher, dass wir mit Access Token verbunden sind (oder refreshen)
         if self.accesstoken:
             await self.check_and_refresh_token()
             await self.connect_with_access_token()
@@ -393,6 +442,8 @@ class HisenseTVController:
             raise RuntimeError("Not authenticated. Call generate_creds() first.")
 
         await self._subscribe(subscribe_topic)
+        # Manche Endpunkte erfordern zusätzlich die Auth-Error-Topic-Subscription; hier reicht i. d. R. das Zieltopic.
+
         await self._publish(publish_topic, None)
         payload = await self._await_topic_once(callback_topic)
         try:
@@ -409,6 +460,8 @@ class HisenseTVController:
             raise RuntimeError("Not authenticated. Call generate_creds() first.")
         await self._publish(publish_topic, command)
 
+    # Public API
+
     async def get_tv_state(self) -> Optional[dict]:
         callback = f"{self.topicBrcsBasepath}ui_service/state"
         subscribe = callback
@@ -419,7 +472,7 @@ class HisenseTVController:
         callback = f"{self.topicMobiBasepath}ui_service/data/sourcelist"
         subscribe = callback
         publish = f"{self.topicTVUIBasepath}actions/sourcelist"
-        return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)
+        return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)  # type: ignore
 
     async def get_volume(self) -> Optional[dict]:
         callback = f"{self.topicBrcsBasepath}platform_service/actions/volumechange"
@@ -431,7 +484,7 @@ class HisenseTVController:
         callback = f"{self.topicMobiBasepath}ui_service/data/applist"
         subscribe = callback
         publish = f"{self.topicTVUIBasepath}actions/applist"
-        return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)
+        return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)  # type: ignore
 
     async def power_cycle_tv(self) -> None:
         publish = f"{self.topicRemoBasepath}actions/sendkey"
@@ -508,12 +561,17 @@ class HisenseTVController:
         await self._send_command(publish_topic=publish, command=cmd)
         return True
 
+
     async def turn_on(self):
         tv_state = await self.get_tv_state()
         if tv_state:
             if "statetype" in tv_state and tv_state["statetype"] == "fake_sleep_0":
-                await self.power_cycle_tv()
-                logger.info("Power cycle command sent.")
+                # Power cycle the TV
+                command_sent = self.power_cycle_tv()
+                if command_sent:
+                    logger.info("Power cycle command sent.")
+                else:
+                    logger.error("Failed to send power cycle command.")
             else:
                 logger.info("TV is already on.")
         else:
@@ -523,12 +581,21 @@ class HisenseTVController:
         tv_state = await self.get_tv_state()
         if tv_state:
             if "statetype" in tv_state and tv_state["statetype"] != "fake_sleep_0":
-                await self.power_cycle_tv()
-                logger.info("Power cycle command sent.")
+                # Power cycle the TV
+                command_sent = self.power_cycle_tv()
+                if command_sent:
+                    logger.info("Power cycle command sent.")
+                else:
+                    logger.error("Failed to send power cycle command.")
             else:
                 logger.info("TV is already off.")
         else:
             logger.error("Failed to get TV state.")
+
+
+    # --------------------------
+    # Utilities
+    # --------------------------
 
     def credentials_summary(self) -> dict:
         return {

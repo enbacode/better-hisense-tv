@@ -20,7 +20,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     ip = entry.data["ip"]
 
     # Direkt gespeicherte Credentials
-    credentials = entry.data["credentials"]
+    credentials = entry.data.get("credentials")
 
     CERT_DATA = """-----BEGIN CERTIFICATE-----
 MIIDvTCCAqWgAwIBAgIBAjANBgkqhkiG9w0BAQsFADBnMQswCQYDVQQGEwJDTjER
@@ -96,6 +96,7 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
     controller.refreshtoken = credentials.get("refreshtoken")
     controller.refreshtoken_time = credentials.get("refreshtoken_time")
     controller.refreshtoken_duration_day = credentials.get("refreshtoken_duration_day")
+    _LOGGER.warning(credentials)
     _LOGGER.warning({"client_id": controller.client_id, "username": controller.username, "password": controller.password,
                      "accesstoken": controller.accesstoken, "accesstoken_time": controller.accesstoken_time,
                      "accesstoken_duration_day": controller.accesstoken_duration_day,
