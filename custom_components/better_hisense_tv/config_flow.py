@@ -136,7 +136,13 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
                             "credentials": {
                                 "client_id": self._controller.client_id,
                                 "username": self._controller.username,
-                                "password": self._controller.password
+                                "password": self._controller.password,
+                                "accesstoken": self._controller.accesstoken,
+                                "accesstoken_time": self._controller.accesstoken_time,
+                                "accesstoken_duration_day": self._controller.accesstoken_duration_day,
+                                "refreshtoken": self._controller.refreshtoken,
+                                "refreshtoken_time": self._controller.refreshtoken_time,
+                                "refreshtoken_duration_day": self._controller.refreshtoken_duration_day,
                             },
                         },
                     )

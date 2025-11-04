@@ -96,6 +96,11 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
     controller.refreshtoken = credentials.get("refreshtoken")
     controller.refreshtoken_time = credentials.get("refreshtoken_time")
     controller.refreshtoken_duration_day = credentials.get("refreshtoken_duration_day")
+    _LOGGER.warning({"client_id": controller.client_id, "username": controller.username, "password": controller.password,
+                     "accesstoken": controller.accesstoken, "accesstoken_time": controller.accesstoken_time,
+                     "accesstoken_duration_day": controller.accesstoken_duration_day,
+                     "refreshtoken": controller.refreshtoken, "refreshtoken_time": controller.refreshtoken_time,
+                     "refreshtoken_duration_day": controller.refreshtoken_duration_day})
     controller._define_topic_paths()
 
     # Verbindung mit Access Token aufbauen
