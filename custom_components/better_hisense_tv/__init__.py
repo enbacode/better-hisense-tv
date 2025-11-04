@@ -20,7 +20,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     ip = entry.data["ip"]
 
     # Direkt gespeicherte Credentials
-    credentials = entry.data
+    credentials = entry.data["credentials"]
 
     CERT_DATA = """-----BEGIN CERTIFICATE-----
 MIIDvTCCAqWgAwIBAgIBAjANBgkqhkiG9w0BAQsFADBnMQswCQYDVQQGEwJDTjER
