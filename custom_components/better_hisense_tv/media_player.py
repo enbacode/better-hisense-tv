@@ -54,7 +54,6 @@ class HisenseTVEntity(MediaPlayerEntity):
 
     async def async_update(self):
         self._coordinator.data = await self._controller.get_tv_state()
-        statetype = self._coordinator.data.get("statetype")
 
         try:
             src_list = await self._controller.get_source_list()
@@ -68,20 +67,6 @@ class HisenseTVEntity(MediaPlayerEntity):
         except Exception as e:
             _LOGGER.debug("Failed to update source list: %s", e)
 
-        if statetype == "fake_sleep_0":
-            self._state = STATE_OFF
-        else:
-            self._state = STATE_ON
-
-        if statetype == "app":
-            self._current_app = self._coordinator.data.get("name")
-            self._title = self._current_app
-            self.state = STATE_PLAYING
-        elif statetype == "sourceswitch":
-            self._current_source = self._coordinator.data.get("displayname")
-            self._title = self._current_source
-            self.state = STATE_PLAYING
-        
         await self._coordinator.async_request_refresh()
 
     @property
@@ -89,14 +74,7 @@ class HisenseTVEntity(MediaPlayerEntity):
         """Set the device class to TV."""
         _LOGGER.debug("device_class")
         return DEVICE_CLASS_TV
-    
-    @property
-    def media_title(self):
-        """Return the title of current playing media."""
-        if self._state == STATE_OFF:
-            return None
 
-        return self._title
 
     @property
     def state(self):
