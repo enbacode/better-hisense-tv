@@ -1,11 +1,12 @@
 from __future__ import annotations
+
 import logging
+import tempfile
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-import tempfile
 
 from .tv_controller import HisenseTVController
 from .const import DOMAIN, PLATFORMS
@@ -13,12 +14,13 @@ from .const import DOMAIN, PLATFORMS
 _LOGGER = logging.getLogger(__name__)
 
 
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Set up Better Hisense TV from a config entry."""
+    """Set up Better Hisense TV (manual credentials mode)."""
 
     ip = entry.data["ip"]
-    credentials = entry.data["credentials"]  # dict from config_flow or YAML
+
+    # Direkt gespeicherte Credentials
+    credentials = entry.data
 
     CERT_DATA = """-----BEGIN CERTIFICATE-----
 MIIDvTCCAqWgAwIBAgIBAjANBgkqhkiG9w0BAQsFADBnMQswCQYDVQQGEwJDTjER
@@ -42,8 +44,7 @@ lcxYNPxbZ824+sSncwx2AujmTJk7eIUoHczhluiU6rapK8apkU/iN4GNcBZkbccn
 9+e4R6eufW/V+58/HJtF9jECeNikLvJpxveCC6Q/N49s72hHZC0L0NeJ7GNKzoOi
 8lXL5QgNGCg/bawsx9q5YvWLsDOVJIEhWv3MxmnC/reIeDf7iMEK3BP5E4u8uTzJ
 Hg==
------END CERTIFICATE-----
-"""
+-----END CERTIFICATE-----"""
 
     KEY_DATA = """-----BEGIN PRIVATE KEY-----
 MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDu/o3p42CAraBA
@@ -72,9 +73,9 @@ lVV2ZSKO8Y0tsAWEZAd2yhCRypE6docOsp7PzvGCQQKBgQCinwRjA6qjSEUcXwR1
 F7ep46RNe8JGpJ2ZMffneFct8P4fyKYMSY5zZBc9kYSxpgJPZc5Y+V5Tq+vWc4SX
 /QNCZLcC5wMVs2jp8LYruoR0QoQdizpvlKQC2s4UD7Lp12lntJsCDULN9G9lzKUI
 LgVhEy5cFTsByGHGWF6LAKrpHA==
------END PRIVATE KEY-----
-"""
+-----END PRIVATE KEY-----"""
 
+    # Temporäre Zertifikatsdateien anlegen
     with tempfile.NamedTemporaryFile(delete=False) as certfile:
         certfile.write(CERT_DATA.encode())
         certfile.flush()
@@ -85,14 +86,31 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
 
     controller = HisenseTVController(ip, certfile=certfile.name, keyfile=keyfile.name)
 
+    # Manuelle Credentials zuweisen
     controller.client_id = credentials.get("client_id")
     controller.username = credentials.get("username")
     controller.password = credentials.get("password")
-    await controller.ensure_connected(controller.username, controller.password, controller.client_id)
+    controller.accesstoken = credentials.get("accesstoken")
+    controller.accesstoken_time = credentials.get("accesstoken_time")
+    controller.accesstoken_duration_day = credentials.get("accesstoken_duration_day")
+    controller.refreshtoken = credentials.get("refreshtoken")
+    controller.refreshtoken_time = credentials.get("refreshtoken_time")
+    controller.refreshtoken_duration_day = credentials.get("refreshtoken_duration_day")
+    controller._define_topic_paths()
+
+    # Verbindung mit Access Token aufbauen
+    try:
+        await controller.connect_with_access_token()
+        _LOGGER.info("Connected to Hisense TV at %s", ip)
+    except Exception as err:
+        _LOGGER.error("Failed to connect to Hisense TV at %s: %s", ip, err)
+        return False
 
     async def async_update_data():
-        """Fetch TV state periodically."""
+        """Periodisch TV-Status abrufen."""
         try:
+            # Automatisch Token-Refresh prüfen
+            await controller.check_and_refresh_token()
             state = await controller.get_tv_state()
             return state or {}
         except Exception as err:
@@ -119,8 +137,8 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Unload integration."""
+    """Unload integration and clean up."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
+        hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok

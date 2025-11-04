@@ -1,4 +1,3 @@
-
 """
 tvcontroller.py — VIDAa/Hisense TV MQTT Controller (async, persistent client)
 
@@ -212,7 +211,7 @@ class HisenseTVController:
 
         if not self._connected_evt.is_set():
             try:
-                await asyncio.wait_for(self._connected_evt.wait(), timeout=60)
+                await asyncio.wait_for(self._connected_evt.wait(), timeout=self.timeout)
             except asyncio.TimeoutError:
                 raise RuntimeError("Timeout while connecting to MQTT broker")
 
@@ -246,7 +245,7 @@ class HisenseTVController:
 
         await self._subscribe(topic)
         try:
-            payload = await asyncio.wait_for(fut, 60)
+            payload = await asyncio.wait_for(fut, timeout=timeout or self.timeout)
             return payload
         finally:
             # Clean-up: diesen Waiter verwerfen
@@ -609,23 +608,3 @@ class HisenseTVController:
             "refreshtoken_time": self.refreshtoken_time,
             "refreshtoken_duration_day": self.refreshtoken_duration_day,
         }
-
-
-
-async def main():
-    ctrl = HisenseTVController("192.168.178.25", "./rcm_certchain_pem.cer", "./rcm_pem_privkey.pkcs8", timeout=60)
-    ctrl.client_id = "41:7b:08:48:21:ad$his$5923DE_vidaacommon_001"
-    ctrl.username = "his$1701263093"
-    ctrl.password = "760644B49DBDF42B98880C8B629FDE07"
-    ctrl.accesstoken = "_x7VSCh8fUQBtmRU2KZQUyp8cfPJTlWrjPARrH4xFM7BSYPu082u"
-    ctrl.refreshtoken = "#x7VSCh8fUQBtmRU2KZQUyp8cfPJTlWrjPARrH4xFM7C/K2WCbCVJdfZJZ5rcTyUO"
-    ctrl.accesstoken_time = 1761741216
-    ctrl.accesstoken_duration_day = 2
-    ctrl.refreshtoken_time = 1761741216
-    ctrl.refreshtoken_duration_day = 30
-    state = await ctrl.get_tv_state()
-    print("TV State:", state)
-
-if __name__ == "__main__":
-
-    asyncio.run(main())
