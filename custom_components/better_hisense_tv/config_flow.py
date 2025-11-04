@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import voluptuous as vol
 
 from homeassistant import config_entries
@@ -31,9 +32,12 @@ class BetterHisenseTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             ip = user_input[CONF_IP]
             self._ip = ip
+            
+            certfile = os.path.join(os.path.dirname(__file__), "../certchain_pem.cer")
+            keyfile = os.path.join(os.path.dirname(__file__), "../rcm_pem_privkey.pkcs8")
 
             # initialize controller
-            controller = HisenseTVController(ip, certfile="./../certchain_pem.cer", keyfile="./../rcm_pem_privkey.pkcs8")
+            controller = HisenseTVController(ip, certfile=certfile, keyfile=keyfile)
             self._controller = controller
 
             try:
