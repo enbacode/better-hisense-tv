@@ -1,30 +1,24 @@
 from __future__ import annotations
 
 import logging
+import os
 import voluptuous as vol
+import tempfile
+
 from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
 from homeassistant.core import callback
+
+CONF_IP = "ip"
 
 from .const import DOMAIN
 from .tv_controller import HisenseTVController
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_IP = "ip"
-CONF_CLIENT_ID = "client_id"
-CONF_USERNAME = "username"
-CONF_PASSWORD = "password"
-CONF_ACCESS_TOKEN = "accesstoken"
-CONF_ACCESS_TOKEN_TIME = "accesstoken_time"
-CONF_ACCESS_TOKEN_DURATION = "accesstoken_duration_day"
-CONF_REFRESH_TOKEN = "refreshtoken"
-CONF_REFRESH_TOKEN_TIME = "refreshtoken_time"
-CONF_REFRESH_TOKEN_DURATION = "refreshtoken_duration_day"
-
 
 class BetterHisenseTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Config flow for Better Hisense TV (manual credentials)."""
+    """Config flow for Better Hisense TV (automatic pairing)."""
 
     VERSION = 1
     CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_PUSH
@@ -34,32 +28,17 @@ class BetterHisenseTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._controller: HisenseTVController | None = None
 
     async def async_step_user(self, user_input=None):
-        """Manually enter credentials and connect."""
+        """Step 1: ask for IP address."""
         errors = {}
-
-        data_schema = vol.Schema({
-            vol.Required(CONF_NAME, default="Hisense TV"): str,
-            vol.Required(CONF_IP): str,
-            vol.Required(CONF_CLIENT_ID): str,
-            vol.Required(CONF_USERNAME): str,
-            vol.Required(CONF_PASSWORD): str,
-            vol.Required(CONF_ACCESS_TOKEN): str,
-            vol.Required(CONF_ACCESS_TOKEN_TIME): int,
-            vol.Required(CONF_ACCESS_TOKEN_DURATION): int,
-            vol.Required(CONF_REFRESH_TOKEN): str,
-            vol.Required(CONF_REFRESH_TOKEN_TIME): int,
-            vol.Required(CONF_REFRESH_TOKEN_DURATION): int,
-        })
-
         if user_input is not None:
             ip = user_input[CONF_IP]
             self._ip = ip
+            certfile = os.path.join(os.path.dirname(__file__), "../certchain_pem.cer")
+            keyfile = os.path.join(os.path.dirname(__file__), "../rcm_pem_privkey.pkcs8")
+            _LOGGER.warning("Cert Paths: %s, %s", certfile, keyfile)
 
-            try:
-                # Controller mit Dummy-Zertifikaten initialisieren
-                # (nicht genutzt, aber erforderlich für MQTT-TLS)
-                import tempfile
-                CERT_DATA = """-----BEGIN CERTIFICATE-----
+
+            CERT_DATA = """-----BEGIN CERTIFICATE-----
 MIIDvTCCAqWgAwIBAgIBAjANBgkqhkiG9w0BAQsFADBnMQswCQYDVQQGEwJDTjER
 MA8GA1UECAwIc2hhbmRvbmcxEDAOBgNVBAcMB3FpbmdkYW8xCzAJBgNVBAoMAmho
 MRMwEQYDVQQLDAptdWx0aW1lZGlhMREwDwYDVQQDDAhSZW1vdGVDQTAeFw0xODA0
@@ -81,8 +60,10 @@ lcxYNPxbZ824+sSncwx2AujmTJk7eIUoHczhluiU6rapK8apkU/iN4GNcBZkbccn
 9+e4R6eufW/V+58/HJtF9jECeNikLvJpxveCC6Q/N49s72hHZC0L0NeJ7GNKzoOi
 8lXL5QgNGCg/bawsx9q5YvWLsDOVJIEhWv3MxmnC/reIeDf7iMEK3BP5E4u8uTzJ
 Hg==
------END CERTIFICATE-----"""
-                KEY_DATA = """-----BEGIN PRIVATE KEY-----
+-----END CERTIFICATE-----
+"""
+
+            KEY_DATA = """-----BEGIN PRIVATE KEY-----
 MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDu/o3p42CAraBA
 19IrYteEt8N8dyAvUmEyTVZMwHobwzNUABrazUXhmFvduh02q/1y2TblB8dHSf53
 WKV+5O+sRpD7dc1lbhgoYLmHp3yVxrVDDKToz22fH54LrLm3t2k3j3ShXMbJIBEQ
@@ -109,46 +90,64 @@ lVV2ZSKO8Y0tsAWEZAd2yhCRypE6docOsp7PzvGCQQKBgQCinwRjA6qjSEUcXwR1
 F7ep46RNe8JGpJ2ZMffneFct8P4fyKYMSY5zZBc9kYSxpgJPZc5Y+V5Tq+vWc4SX
 /QNCZLcC5wMVs2jp8LYruoR0QoQdizpvlKQC2s4UD7Lp12lntJsCDULN9G9lzKUI
 LgVhEy5cFTsByGHGWF6LAKrpHA==
------END PRIVATE KEY-----"""
-                with tempfile.NamedTemporaryFile(delete=False) as certf:
-                    certf.write(CERT_DATA.encode())
-                    certf.flush()
-                with tempfile.NamedTemporaryFile(delete=False) as keyf:
-                    keyf.write(KEY_DATA.encode())
-                    keyf.flush()
+-----END PRIVATE KEY-----
+"""
 
-                controller = HisenseTVController(ip, certfile=certf.name, keyfile=keyf.name)
-                controller.client_id = user_input[CONF_CLIENT_ID]
-                controller.username = user_input[CONF_USERNAME]
-                controller.password = user_input[CONF_PASSWORD]
-                controller.accesstoken = user_input[CONF_ACCESS_TOKEN]
-                controller.accesstoken_time = user_input[CONF_ACCESS_TOKEN_TIME]
-                controller.accesstoken_duration_day = user_input[CONF_ACCESS_TOKEN_DURATION]
-                controller.refreshtoken = user_input[CONF_REFRESH_TOKEN]
-                controller.refreshtoken_time = user_input[CONF_REFRESH_TOKEN_TIME]
-                controller.refreshtoken_duration_day = user_input[CONF_REFRESH_TOKEN_DURATION]
-                controller._define_topic_paths()
-                self._controller = controller
+            with tempfile.NamedTemporaryFile(delete=False) as certfile:
+                certfile.write(CERT_DATA.encode())
+                certfile.flush()
 
-                # Verbindung testen
-                try:
-                    await controller.connect_with_access_token()
-                    _LOGGER.info("Successfully connected to Hisense TV at %s", ip)
-                except Exception as ex:
-                    _LOGGER.error("Failed to connect using provided credentials: %s", ex)
-                    errors["base"] = "connection_failed"
-                    return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
+            with tempfile.NamedTemporaryFile(delete=False) as keyfile:
+                keyfile.write(KEY_DATA.encode())
+                keyfile.flush()
 
-                return self.async_create_entry(
-                    title=f"Hisense TV ({ip})",
-                    data=user_input
-                )
+            controller = HisenseTVController(ip, certfile=certfile.name, keyfile=keyfile.name)
 
+            # initialize controller
+            self._controller = controller
+
+            try:
+                _LOGGER.debug("Starting pairing with Hisense TV at %s", ip)
+                await controller.request_auth_code()
+                return await self.async_step_authcode()
             except Exception as e:
-                _LOGGER.error("Setup failed: %s", e)
-                errors["base"] = "unknown_error"
+                _LOGGER.error("Failed to connect to TV at %s: %s", ip, e)
+                errors["base"] = "connection_failed"
+
+        data_schema = vol.Schema({
+            vol.Required(CONF_NAME, default="Hisense TV"): str,
+            vol.Required(CONF_IP): str,
+        })
 
         return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
+
+    async def async_step_authcode(self, user_input=None):
+        """Step 2: user enters the 4-digit code from the TV screen."""
+        errors = {}
+        if user_input is not None:
+            auth_code = user_input["auth_code"]
+
+            try:
+                await self._controller.verify_auth_code(auth_code)
+                return self.async_create_entry(
+                        title=f"Hisense TV ({self._ip})",
+                        data={
+                            "ip": self._ip,
+                            "credentials": {
+                                "client_id": self._controller.client_id,
+                                "username": self._controller.username,
+                                "password": self._controller.password
+                            },
+                        },
+                    )
+            except Exception as e:
+                _LOGGER.error("Authentication failed: %s", e)
+                errors["base"] = "auth_failed"
+
+        schema = vol.Schema({
+            vol.Required("auth_code", description="Code shown on your TV"): str,
+        })
+        return self.async_show_form(step_id="authcode", data_schema=schema, errors=errors)
 
     @staticmethod
     @callback
@@ -157,20 +156,19 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
 
 
 class BetterHisenseTVOptionsFlow(config_entries.OptionsFlow):
-    """Allow editing IP and tokens later."""
+    """Handle options flow (edit existing entry)."""
 
     def __init__(self, config_entry):
         self.config_entry = config_entry
 
     async def async_step_init(self, user_input=None):
+        """Allow changing only the IP address."""
         if user_input is not None:
             data = self.config_entry.data.copy()
-            data.update(user_input)
+            data["ip"] = user_input["ip"]
             return self.async_create_entry(title="", data=data)
-
+            
         schema = vol.Schema({
-            vol.Required(CONF_IP, default=self.config_entry.data.get(CONF_IP, "")): str,
-            vol.Optional(CONF_ACCESS_TOKEN, default=self.config_entry.data.get(CONF_ACCESS_TOKEN, "")): str,
-            vol.Optional(CONF_REFRESH_TOKEN, default=self.config_entry.data.get(CONF_REFRESH_TOKEN, "")): str,
+            vol.Required("ip", default=self.config_entry.data.get("ip", "")): str,
         })
         return self.async_show_form(step_id="init", data_schema=schema)
