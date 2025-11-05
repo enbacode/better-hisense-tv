@@ -353,6 +353,7 @@ class HisenseTVController:
         self.authenticated = True
         return self.accesstoken
 
+
     async def check_and_refresh_token(self) -> str:
         """Prüft Gültigkeit des Access Tokens und refreshed falls nötig."""
         assert self.accesstoken and self.accesstoken_time and self.accesstoken_duration_day
