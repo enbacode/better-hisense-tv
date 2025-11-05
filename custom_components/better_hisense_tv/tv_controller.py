@@ -49,10 +49,8 @@ class HisenseTVController:
         check_interval: float = 0.1,
         timeout: float = 60.0,
         debug: bool = False,
-        mac: Optional[str] = None,
     ) -> None:
         self.tv_ip = tv_ip
-        self.mac_address = mac
         self.certfile = certfile
         self.keyfile = keyfile
         self.random_mac = random_mac

@@ -6,7 +6,7 @@ import voluptuous as vol
 import tempfile
 
 from homeassistant import config_entries
-from homeassistant.const import CONF_NAME, CONF_MAC
+from homeassistant.const import CONF_NAME
 from homeassistant.core import callback
 
 CONF_IP = "ip"
@@ -117,7 +117,6 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
         data_schema = vol.Schema({
             vol.Required(CONF_NAME, default="Hisense TV"): str,
             vol.Required(CONF_IP): str,
-            vol.Required(CONF_MAC): str
         })
 
         return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
@@ -173,11 +172,9 @@ class BetterHisenseTVOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             data = self.config_entry.data.copy()
             data["ip"] = user_input["ip"]
-            data["mac"] = user_input["mac"]
             return self.async_create_entry(title="", data=data)
             
         schema = vol.Schema({
             vol.Required("ip", default=self.config_entry.data.get("ip", "")): str,
-            vol.Required("mac", default=self.config_entry.data.get("mac", "")): str,
         })
         return self.async_show_form(step_id="init", data_schema=schema)

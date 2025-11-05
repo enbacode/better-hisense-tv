@@ -97,7 +97,7 @@ class HisenseTVEntity(MediaPlayerEntity):
 
     async def async_turn_on(self):
         _LOGGER.debug("Turning on Hisense TV")
-        wakeonlan.send_magic_packet(self._controller.mac_address)
+        wakeonlan.send_magic_packet("bc:5c:17:da:bc:5e", ip_address=self._controller.tv_ip)
         await self._coordinator.async_request_refresh()
 
     async def async_turn_off(self):
