@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 import asyncio
+import wakeonlan
 
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
@@ -96,8 +97,7 @@ class HisenseTVEntity(MediaPlayerEntity):
 
     async def async_turn_on(self):
         _LOGGER.debug("Turning on Hisense TV")
-        await self._controller.turn_on()
-        self._coordinator.data = await self._controller.get_tv_state()
+        wakeonlan.send_magic_packet(self._controller.mac_address)
         await self._coordinator.async_request_refresh()
 
     async def async_turn_off(self):

@@ -49,8 +49,10 @@ class HisenseTVController:
         check_interval: float = 0.1,
         timeout: float = 60.0,
         debug: bool = False,
+        mac: Optional[str] = None,
     ) -> None:
         self.tv_ip = tv_ip
+        self.mac_address = mac
         self.certfile = certfile
         self.keyfile = keyfile
         self.random_mac = random_mac
@@ -357,7 +359,7 @@ class HisenseTVController:
         """Prüft Gültigkeit des Access Tokens und refreshed falls nötig."""
         assert self.accesstoken and self.accesstoken_time and self.accesstoken_duration_day
         now = time.time()
-        exp = int(self.accesstoken_time) + (self.accesstoken_duration_day * 24 * 60 * 60)
+        exp = str(self.accesstoken_time) + (self.accesstoken_duration_day * 24 * 60 * 60)
 
         if now <= exp:
             if self.debug:

@@ -18,6 +18,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Better Hisense TV (manual credentials mode)."""
 
     ip = entry.data["ip"]
+    mac = entry.data["mac"]
 
     # Direkt gespeicherte Credentials
     credentials = entry.data.get("credentials")
@@ -84,7 +85,7 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
         keyfile.write(KEY_DATA.encode())
         keyfile.flush()
 
-    controller = HisenseTVController(ip, certfile=certfile.name, keyfile=keyfile.name)
+    controller = HisenseTVController(ip, certfile=certfile.name, keyfile=keyfile.name, mac=mac)
 
     # Manuelle Credentials zuweisen
     controller.client_id = credentials.get("client_id")
