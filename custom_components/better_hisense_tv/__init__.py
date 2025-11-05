@@ -84,7 +84,7 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
         keyfile.write(KEY_DATA.encode())
         keyfile.flush()
 
-    controller = HisenseTVController(ip, certfile=certfile.name, keyfile=keyfile.name, mac=mac)
+    controller = HisenseTVController(ip, certfile=certfile.name, keyfile=keyfile.name)
 
     # Manuelle Credentials zuweisen
     controller.client_id = credentials.get("client_id")
