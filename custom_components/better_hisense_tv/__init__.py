@@ -18,7 +18,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Better Hisense TV (manual credentials mode)."""
 
     ip = entry.data["ip"]
-    mac = entry.data["mac"]
 
     # Direkt gespeicherte Credentials
     credentials = entry.data.get("credentials")
