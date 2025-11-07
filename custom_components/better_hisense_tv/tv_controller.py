@@ -520,14 +520,14 @@ class HisenseTVController:
         """Change TV input source."""
         logger.info("=== CHANGE SOURCE: %s ===", source_id)
         
-        state = await self.get_tv_state()
-        if not state:
-            logger.error("Failed to get TV state.")
-            return False
+        # state = await self.get_tv_state()
+        # if not state:
+        #     logger.error("Failed to get TV state.")
+        #     return False
             
-        if state.get("statetype") == "fake_sleep_0":
-            logger.warning("TV is off. Not changing source...")
-            return False
+        # if state.get("statetype") == "fake_sleep_0":
+        #     logger.warning("TV is off. Not changing source...")
+        #     return False
         
         if not self.topicTVUIBasepath:
             logger.error("topicTVUIBasepath is not set!")
@@ -549,14 +549,14 @@ class HisenseTVController:
         """Change TV volume."""
         logger.info("=== CHANGE VOLUME: %d ===", volume)
         
-        state = await self.get_tv_state()
-        if not state:
-            logger.error("Failed to get TV state.")
-            return False
+        # state = await self.get_tv_state()
+        # if not state:
+        #     logger.error("Failed to get TV state.")
+        #     return False
             
-        if state.get("statetype") == "fake_sleep_0":
-            logger.warning("TV is off. Not changing volume...")
-            return False
+        # if state.get("statetype") == "fake_sleep_0":
+        #     logger.warning("TV is off. Not changing volume...")
+        #     return False
         
         if not self.topicTVPSBasepath:
             logger.error("topicTVPSBasepath is not set!")
@@ -594,13 +594,13 @@ class HisenseTVController:
             logger.error("Failed to find app in app list.")
             return False
 
-        state = await self.get_tv_state()
-        if not state:
-            logger.error("Failed to get TV state.")
-            return False
-        if state.get("statetype") == "fake_sleep_0":
-            logger.info("TV is off. Not launching app...")
-            return False
+        # state = await self.get_tv_state()
+        # if not state:
+        #     logger.error("Failed to get TV state.")
+        #     return False
+        # if state.get("statetype") == "fake_sleep_0":
+        #     logger.info("TV is off. Not launching app...")
+        #     return False
 
         publish = f"{self.topicTVUIBasepath}actions/launchapp"
         cmd = json.dumps({"appId": app_id, "name": resolved_name, "url": app_url})
@@ -608,26 +608,18 @@ class HisenseTVController:
         return True
 
     async def turn_on(self):
-        tv_state = await self.get_tv_state()
-        if tv_state:
-            if "statetype" in tv_state and tv_state["statetype"] == "fake_sleep_0":
-                await self.power_cycle_tv()
-                logger.info("Power cycle command sent.")
-            else:
-                logger.info("TV is already on.")
-        else:
-            logger.error("Failed to get TV state.")
+        await self.power_cycle_tv()
 
     async def turn_off(self):
-        tv_state = await self.get_tv_state()
-        if tv_state:
-            if "statetype" in tv_state and tv_state["statetype"] != "fake_sleep_0":
-                await self.power_cycle_tv()
-                logger.info("Power cycle command sent.")
-            else:
-                logger.info("TV is already off.")
-        else:
-            logger.error("Failed to get TV state.")
+        await self.power_cycle_tv()
+        # tv_state = await self.get_tv_state()
+        # if tv_state:
+        #     if "statetype" in tv_state and tv_state["statetype"] != "fake_sleep_0":
+        #         logger.info("Power cycle command sent.")
+        #     else:
+        #         logger.info("TV is already off.")
+        # else:
+        #     logger.error("Failed to get TV state.")
 
     def credentials_summary(self) -> dict:
         return {
