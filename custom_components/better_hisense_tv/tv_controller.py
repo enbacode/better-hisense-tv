@@ -171,9 +171,18 @@ class HisenseTVController:
             self._subscriptions.add(topic)
 
     async def _publish(self, topic: str, payload: Optional[str]) -> None:
+        """Publish message to MQTT topic."""
         async with self._lock:
-            assert self.client is not None
+            assert self.client is not None, "Client not initialized"
+            
+            logger.info("Publishing message:")
+            logger.info("  Topic: %s", topic)
+            logger.info("  Payload: %s", payload)
+            logger.info("  Client connected: %s", self.client.is_connected())
+            
             res = self.client.publish(topic, payload)
+            logger.info("Publish result code: %s (0=success)", res.rc)
+            
             if res.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise RuntimeError(f"Failed to publish to {topic}: code {res.rc}")
 
@@ -376,14 +385,23 @@ class HisenseTVController:
         return await self.refresh_token()
 
     async def connect_with_access_token(self) -> None:
+        """Connect using stored access token."""
+        logger.info("=== CONNECTING WITH ACCESS TOKEN ===")
+        logger.info("Username: %s", self.username)
+        logger.info("Client ID: %s", self.client_id)
+        logger.info("Access token exists: %s", bool(self.accesstoken))
+        logger.info("Currently connected: %s", self.is_connected)
+        
         assert self.username and self.client_id and self.accesstoken
 
         # Nur neu verbinden, wenn nicht schon verbunden
         if self.is_connected and self.client is not None:
+            logger.info("Already connected, skipping reconnect")
             return
 
         # Disconnect old client if exists
         if self.client:
+            logger.info("Disconnecting old client...")
             self.client.loop_stop()
             self.client.disconnect()
             self.client = None
@@ -392,10 +410,13 @@ class HisenseTVController:
             self.is_connected = False
 
         try:
+            logger.info("Establishing new connection...")
             await self.ensure_connected(self.username, self.accesstoken, self.client_id)
             self.is_connected = True
-        except Exception:
+            logger.info("Connection established successfully")
+        except Exception as e:
             self.is_connected = False
+            logger.error("Connection failed: %s", e, exc_info=True)
             raise
 
     async def _get_info(self, *, callback_topic: str, subscribe_topic: str, publish_topic: str) -> Optional[dict]:
@@ -415,12 +436,22 @@ class HisenseTVController:
             return None
 
     async def _send_command(self, *, publish_topic: str, command: Optional[str]) -> None:
+        """Send command to TV via MQTT."""
+        logger.info("=== SENDING COMMAND ===")  # Changed from debug to info
+        logger.info("Topic: %s", publish_topic)
+        logger.info("Command: %s", command)
+        logger.info("Access token exists: %s", bool(self.accesstoken))
+        logger.info("Connected: %s", self.is_connected)
+        
         if self.accesstoken:
             await self.check_and_refresh_token()
             await self.connect_with_access_token()
         else:
             raise RuntimeError("Not authenticated. Call generate_creds() first.")
+        
+        logger.info("Publishing to topic: %s", publish_topic)
         await self._publish(publish_topic, command)
+        logger.info("Command published successfully")
 
     async def get_tv_state(self) -> Optional[dict]:
         callback = f"{self.topicBrcsBasepath}ui_service/state"
@@ -447,45 +478,108 @@ class HisenseTVController:
         return await self._get_info(callback_topic=callback, subscribe_topic=subscribe, publish_topic=publish)
 
     async def power_cycle_tv(self) -> None:
+        """Toggle TV power state."""
+        logger.info("=== POWER CYCLE TV ===")
+        logger.info("Remote topic base: %s", self.topicRemoBasepath)
+        
+        # WICHTIG: Überprüfe ob topicRemoBasepath gesetzt ist
+        if not self.topicRemoBasepath:
+            logger.error("topicRemoBasepath is not set! Call _define_topic_paths() first")
+            raise RuntimeError("Topic paths not initialized")
+        
         publish = f"{self.topicRemoBasepath}actions/sendkey"
+        logger.info("Full publish topic: %s", publish)
+        
         await self._send_command(publish_topic=publish, command="KEY_POWER")
+        logger.info("Power cycle command sent")
 
     async def send_key(self, key: str) -> bool:
+        """Send key press to TV."""
+        logger.info("=== SEND KEY: %s ===", key)
+        
+        # Überprüfe TV-Status
         state = await self.get_tv_state()
+        logger.info("Current TV state: %s", state)
+        
         if not state:
             logger.error("Failed to get TV state.")
             return False
+            
         if state.get("statetype") == "fake_sleep_0":
-            logger.info("TV is off. Not sending key...")
+            logger.warning("TV is off (statetype=fake_sleep_0). Not sending key...")
             return False
+        
+        if not self.topicRemoBasepath:
+            logger.error("topicRemoBasepath is not set!")
+            return False
+        
         publish = f"{self.topicRemoBasepath}actions/sendkey"
-        await self._send_command(publish_topic=publish, command=key)
-        return True
-
+        logger.info("Sending key to topic: %s", publish)
+        
+        try:
+            await self._send_command(publish_topic=publish, command=key)
+            logger.info("Key sent successfully")
+            return True
+        except Exception as e:
+            logger.error("Failed to send key: %s", e, exc_info=True)
+            return False
+        
     async def change_source(self, source_id: str | int) -> bool:
+        """Change TV input source."""
+        logger.info("=== CHANGE SOURCE: %s ===", source_id)
+        
         state = await self.get_tv_state()
         if not state:
             logger.error("Failed to get TV state.")
             return False
+            
         if state.get("statetype") == "fake_sleep_0":
-            logger.info("TV is off. Not changing source...")
+            logger.warning("TV is off. Not changing source...")
             return False
+        
+        if not self.topicTVUIBasepath:
+            logger.error("topicTVUIBasepath is not set!")
+            return False
+        
         publish = f"{self.topicTVUIBasepath}actions/changesource"
         cmd = json.dumps({"sourceid": source_id})
-        await self._send_command(publish_topic=publish, command=cmd)
-        return True
+        logger.info("Changing source via topic: %s with payload: %s", publish, cmd)
+        
+        try:
+            await self._send_command(publish_topic=publish, command=cmd)
+            logger.info("Source change command sent")
+            return True
+        except Exception as e:
+            logger.error("Failed to change source: %s", e, exc_info=True)
+            return False
 
     async def change_volume(self, volume: int) -> bool:
+        """Change TV volume."""
+        logger.info("=== CHANGE VOLUME: %d ===", volume)
+        
         state = await self.get_tv_state()
         if not state:
             logger.error("Failed to get TV state.")
             return False
+            
         if state.get("statetype") == "fake_sleep_0":
-            logger.info("TV is off. Not changing volume...")
+            logger.warning("TV is off. Not changing volume...")
             return False
+        
+        if not self.topicTVPSBasepath:
+            logger.error("topicTVPSBasepath is not set!")
+            return False
+        
         publish = f"{self.topicTVPSBasepath}actions/changevolume"
-        await self._send_command(publish_topic=publish, command=str(volume))
-        return True
+        logger.info("Changing volume via topic: %s", publish)
+        
+        try:
+            await self._send_command(publish_topic=publish, command=str(volume))
+            logger.info("Volume change command sent")
+            return True
+        except Exception as e:
+            logger.error("Failed to change volume: %s", e, exc_info=True)
+            return False
 
     async def launch_app(self, app_name: str, app_list: Optional[list] = None) -> bool:
         if not app_list:
