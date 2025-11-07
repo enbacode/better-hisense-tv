@@ -497,17 +497,8 @@ class HisenseTVController:
         """Send key press to TV."""
         logger.info("=== SEND KEY: %s ===", key)
         
-        # Überprüfe TV-Status
-        state = await self.get_tv_state()
-        logger.info("Current TV state: %s", state)
-        
-        if not state:
-            logger.error("Failed to get TV state.")
-            return False
-            
-        if state.get("statetype") == "fake_sleep_0":
-            logger.warning("TV is off (statetype=fake_sleep_0). Not sending key...")
-            return False
+        # WICHTIG: Prüfe TV-Status OHNE get_tv_state zu callen
+        # Der State-Check sollte optional sein, nicht blockierend
         
         if not self.topicRemoBasepath:
             logger.error("topicRemoBasepath is not set!")
@@ -523,7 +514,8 @@ class HisenseTVController:
         except Exception as e:
             logger.error("Failed to send key: %s", e, exc_info=True)
             return False
-        
+
+
     async def change_source(self, source_id: str | int) -> bool:
         """Change TV input source."""
         logger.info("=== CHANGE SOURCE: %s ===", source_id)
