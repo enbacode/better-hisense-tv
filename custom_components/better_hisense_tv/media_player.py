@@ -7,7 +7,6 @@ import wakeonlan
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
-    DEVICE_CLASS_TV
 )
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNKNOWN, ATTR_ATTRIBUTION, STATE_IDLE, STATE_PLAYING, STATE_PAUSED
 
@@ -19,9 +18,23 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    data = hass.data[DOMAIN][entry.entry_id]
-    controller = data["controller"]
-    coordinator = data["coordinator"]
+    """Set up the Hisense TV media_player entity safely."""
+    domain_data = hass.data.get(DOMAIN)
+    if not domain_data:
+        _LOGGER.warning("Domain %s not initialized yet", DOMAIN)
+        return
+
+    data = domain_data.get(entry.entry_id)
+    if not data:
+        _LOGGER.warning("No entry data found for %s (entry_id=%s)", DOMAIN, entry.entry_id)
+        return
+
+    controller = data.get("controller")
+    coordinator = data.get("coordinator")
+
+    if not controller or not coordinator:
+        _LOGGER.warning("Controller or coordinator missing for %s", DOMAIN)
+        return
 
     async_add_entities([HisenseTVEntity(controller, coordinator)], True)
 
@@ -54,28 +67,30 @@ class HisenseTVEntity(MediaPlayerEntity):
         self._title: str | None = None
 
     async def async_update(self):
-        self._coordinator.data = await self._controller.get_tv_state()
+
+        if not self._controller.is_connected:
+            _LOGGER.debug("TV not connected, assuming OFF.")
+            self._state = STATE_OFF
+            return
 
         try:
-            src_list = await self._controller.get_source_list()
-            self._sources = [s for s in src_list if s]
+            self._coordinator.data = await self._controller.get_tv_state()
         except Exception as e:
-            _LOGGER.debug("Failed to update source list: %s", e)
+            _LOGGER.debug("TV state not available: %s", e)
+            self._state = STATE_OFF
+            return
 
-        try:
-            app_list = await self._controller.get_app_list()
-            self._apps = [s for s in app_list if s]
-        except Exception as e:
-            _LOGGER.debug("Failed to update source list: %s", e)
-
-        await self._coordinator.async_request_refresh()
-
-    @property
-    def device_class(self):
-        """Set the device class to TV."""
-        _LOGGER.debug("device_class")
-        return DEVICE_CLASS_TV
-
+        data = self._coordinator.data or {}
+        if data.get("statetype") == "fake_sleep_0":
+            self._state = STATE_OFF
+        else:
+            self._state = STATE_ON
+            
+        self._state = STATE_ON
+        self._volume = (data.get("volume") or {}).get("volumevalue", 0) / 100
+        self._sources = data.get("sources") or []
+        self._apps = data.get("apps") or []
+        
 
     @property
     def state(self):
@@ -97,8 +112,21 @@ class HisenseTVEntity(MediaPlayerEntity):
 
     async def async_turn_on(self):
         _LOGGER.debug("Turning on Hisense TV")
-        wakeonlan.send_magic_packet("bc:5c:17:da:bc:5e", ip_address=self._controller.tv_ip)
         await self._coordinator.async_request_refresh()
+        
+        try:
+            if self._controller.is_connected:
+                await self._controller.turn_on()
+            else:
+                _LOGGER.debug("TV not connected — sending Wake-on-LAN packet.")
+                wakeonlan.send_magic_packet(
+                    "bc:5c:17:da:bc:5e", ip_address=self._controller.tv_ip
+                )
+            self._state = STATE_ON
+        except Exception as e:
+            _LOGGER.warning("Unable to turn on TV: %s", e)
+        finally:
+            await self._coordinator.async_request_refresh()
 
     async def async_turn_off(self):
         _LOGGER.debug("Turning off Hisense TV")
@@ -131,15 +159,15 @@ class HisenseTVEntity(MediaPlayerEntity):
 
     async def async_media_play(self):
         await self._controller.send_key("KEY_PLAY")
-        self.state = STATE_PLAYING
+        self._state = STATE_PLAYING
 
     async def async_media_pause(self):
         await self._controller.send_key("KEY_PAUSE")
-        self.state = STATE_PAUSED
+        self._state = STATE_PAUSED
 
     async def async_media_stop(self):
         await self._controller.send_key("KEY_STOP")
-        self.state = STATE_IDLE
+        self._state = STATE_IDLE
 
     @property
     def source_list(self):

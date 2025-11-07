@@ -16,6 +16,7 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Better Hisense TV (manual credentials mode)."""
+    hass.data.setdefault(DOMAIN, {})
 
     ip = entry.data["ip"]
 
@@ -104,24 +105,47 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
                      "refreshtoken_duration_day": controller.refreshtoken_duration_day})
     controller._define_topic_paths()
 
-    # Verbindung mit Access Token aufbauen
     try:
         await controller.connect_with_access_token()
         _LOGGER.info("Connected to Hisense TV at %s", ip)
     except Exception as err:
-        _LOGGER.error("Failed to connect to Hisense TV at %s: %s", ip, err)
-        return False
+        _LOGGER.warning(
+            "Hisense TV at %s not reachable (probably powered off). Integration will continue. Error: %s",
+            ip, err
+        )
 
     async def async_update_data():
-        """Periodisch TV-Status abrufen."""
+        """Periodic TV state update with reconnect logic."""
         try:
-            # Automatisch Token-Refresh prüfen
-            await controller.check_and_refresh_token()
-            state = await controller.get_tv_state()
-            return state or {}
+            if not controller.is_connected:
+                _LOGGER.debug("Controller not connected, trying reconnect...")
+                try:
+                    await controller.connect_with_access_token()
+                    _LOGGER.info("Reconnected to Hisense TV at %s", ip)
+                except Exception as e:
+                    _LOGGER.debug("Reconnect failed: %s", e)
+                    return {"statetype": "fake_sleep_0"}
+
+            try:
+                await controller.check_and_refresh_token()
+            except Exception as e:
+                _LOGGER.debug("Token refresh failed: %s", e)
+
+            state = await controller.get_tv_state() or {"statetype": "fake_sleep_0"}
+
+            if state.get("statetype") != "fake_sleep_0":
+                try:
+                    state["volume"] = await controller.get_volume()
+                    state["sources"] = await controller.get_source_list()
+                    state["apps"] = await controller.get_app_list()
+                except Exception as inner_err:
+                    _LOGGER.debug("Partial update failed: %s", inner_err)
+
+            return state
+
         except Exception as err:
-            _LOGGER.warning("Failed to update Hisense TV state: %s", err)
-            return {}
+            _LOGGER.debug("TV update failed (likely off): %s", err)
+            return {"statetype": "fake_sleep_0"}
 
     coordinator = DataUpdateCoordinator(
         hass,
@@ -133,14 +157,15 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
 
     await coordinator.async_config_entry_first_refresh()
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+    hass.data[DOMAIN][entry.entry_id] = {
         "controller": controller,
         "coordinator": coordinator,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    return True
 
+    _LOGGER.debug("Better Hisense TV setup complete for %s", entry.entry_id)
+    return True  # ✅ <- das ist zwingend nötig!
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Unload integration and clean up."""

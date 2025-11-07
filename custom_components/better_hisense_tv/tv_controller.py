@@ -63,6 +63,7 @@ class HisenseTVController:
         self._lock = asyncio.Lock()
         self._topic_waiters: Dict[str, asyncio.Future] = {}
         self._subscriptions: set[str] = set()
+        self.is_connected: bool = False
 
         self.reply = None
         self.authentication_payload = None
@@ -118,13 +119,16 @@ class HisenseTVController:
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             client.connected_flag = True
+            self.is_connected = True
             self._connected_evt.set()
             logger.info("Connected to MQTT broker")
         else:
+            self.is_connected = False
             logger.error(f"Bad connection. Returned code: {rc}")
             client.cancel_loop = True
 
     def _on_disconnect(self, client, userdata, rc):
+        self.is_connected = False
         logger.info(f"Disconnected. Reason: {rc}")
         self._connected_evt.clear()
 
@@ -143,10 +147,7 @@ class HisenseTVController:
             fut.set_result(payload)
 
     async def ensure_connected(self, username: str, password: str, client_id: str) -> None:
-        """
-        Erstellt (falls nötig) den Client, startet loop und wartet bis verbunden.
-        """
-        if self.client is None:
+        if self.client is None or not self.is_connected:
             self.client = self._build_client(client_id=client_id, username=username, password=password)
             self.client.loop_start()
             self.client.connect_async(self.tv_ip, 36669, 60)
@@ -154,7 +155,9 @@ class HisenseTVController:
         if not self._connected_evt.is_set():
             try:
                 await asyncio.wait_for(self._connected_evt.wait(), timeout=self.timeout)
+                self.is_connected = True
             except asyncio.TimeoutError:
+                self.is_connected = False
                 raise RuntimeError("Timeout while connecting to MQTT broker")
 
     async def _subscribe(self, topic: str, qos: int = 0) -> None:
@@ -373,9 +376,12 @@ class HisenseTVController:
         return await self.refresh_token()
 
     async def connect_with_access_token(self) -> None:
-        """Verbindet den MQTT-Client mit dem aktuellen Access Token."""
         assert self.username and self.client_id and self.accesstoken
-        
+
+        # Nur neu verbinden, wenn nicht schon verbunden
+        if self.is_connected and self.client is not None:
+            return
+
         # Disconnect old client if exists
         if self.client:
             self.client.loop_stop()
@@ -383,8 +389,14 @@ class HisenseTVController:
             self.client = None
             self._connected_evt.clear()
             self._subscriptions.clear()
-            
-        await self.ensure_connected(self.username, self.accesstoken, self.client_id)
+            self.is_connected = False
+
+        try:
+            await self.ensure_connected(self.username, self.accesstoken, self.client_id)
+            self.is_connected = True
+        except Exception:
+            self.is_connected = False
+            raise
 
     async def _get_info(self, *, callback_topic: str, subscribe_topic: str, publish_topic: str) -> Optional[dict]:
         if self.accesstoken:
