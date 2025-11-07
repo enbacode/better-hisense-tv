@@ -6,7 +6,7 @@ from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .tv_controller import HisenseTVController
 from .const import DOMAIN, PLATFORMS
@@ -19,9 +19,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data.setdefault(DOMAIN, {})
 
     ip = entry.data["ip"]
-
-    # Direkt gespeicherte Credentials
     credentials = entry.data.get("credentials")
+
+    if not credentials:
+        _LOGGER.error("No credentials found in config entry")
+        return False
 
     CERT_DATA = """-----BEGIN CERTIFICATE-----
 MIIDvTCCAqWgAwIBAgIBAjANBgkqhkiG9w0BAQsFADBnMQswCQYDVQQGEwJDTjER
@@ -76,18 +78,19 @@ F7ep46RNe8JGpJ2ZMffneFct8P4fyKYMSY5zZBc9kYSxpgJPZc5Y+V5Tq+vWc4SX
 LgVhEy5cFTsByGHGWF6LAKrpHA==
 -----END PRIVATE KEY-----"""
 
-    # Temporäre Zertifikatsdateien anlegen
-    with tempfile.NamedTemporaryFile(delete=False) as certfile:
-        certfile.write(CERT_DATA.encode())
-        certfile.flush()
+    # Create temporary certificate files
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as certfile:
+        certfile.write(CERT_DATA)
+        cert_path = certfile.name
 
-    with tempfile.NamedTemporaryFile(delete=False) as keyfile:
-        keyfile.write(KEY_DATA.encode())
-        keyfile.flush()
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.key') as keyfile:
+        keyfile.write(KEY_DATA)
+        key_path = keyfile.name
 
-    controller = HisenseTVController(ip, certfile=certfile.name, keyfile=keyfile.name)
+    # Initialize controller
+    controller = HisenseTVController(ip, certfile=cert_path, keyfile=key_path)
 
-    # Manuelle Credentials zuweisen
+    # Apply stored credentials
     controller.client_id = credentials.get("client_id")
     controller.username = credentials.get("username")
     controller.password = credentials.get("password")
@@ -97,79 +100,137 @@ LgVhEy5cFTsByGHGWF6LAKrpHA==
     controller.refreshtoken = credentials.get("refreshtoken")
     controller.refreshtoken_time = credentials.get("refreshtoken_time")
     controller.refreshtoken_duration_day = credentials.get("refreshtoken_duration_day")
-    _LOGGER.warning(credentials)
-    _LOGGER.warning({"client_id": controller.client_id, "username": controller.username, "password": controller.password,
-                     "accesstoken": controller.accesstoken, "accesstoken_time": controller.accesstoken_time,
-                     "accesstoken_duration_day": controller.accesstoken_duration_day,
-                     "refreshtoken": controller.refreshtoken, "refreshtoken_time": controller.refreshtoken_time,
-                     "refreshtoken_duration_day": controller.refreshtoken_duration_day})
+    
     controller._define_topic_paths()
 
+    _LOGGER.info("Initializing Hisense TV at %s with stored credentials", ip)
+
+    # Try initial connection
     try:
         await controller.connect_with_access_token()
-        _LOGGER.info("Connected to Hisense TV at %s", ip)
+        _LOGGER.info("Successfully connected to Hisense TV at %s", ip)
     except Exception as err:
         _LOGGER.warning(
-            "Hisense TV at %s not reachable (probably powered off). Integration will continue. Error: %s",
+            "Initial connection to Hisense TV at %s failed (TV might be off): %s",
             ip, err
         )
 
     async def async_update_data():
         """Periodic TV state update with reconnect logic."""
         try:
+            # Try to reconnect if not connected
             if not controller.is_connected:
-                _LOGGER.debug("Controller not connected, trying reconnect...")
+                _LOGGER.debug("Controller not connected, attempting reconnect...")
                 try:
                     await controller.connect_with_access_token()
                     _LOGGER.info("Reconnected to Hisense TV at %s", ip)
                 except Exception as e:
                     _LOGGER.debug("Reconnect failed: %s", e)
-                    return {"statetype": "fake_sleep_0"}
+                    # Return offline state
+                    return {
+                        "statetype": "fake_sleep_0",
+                        "volume": None,
+                        "sources": [],
+                        "apps": []
+                    }
 
+            # Check and refresh token if needed
             try:
                 await controller.check_and_refresh_token()
             except Exception as e:
-                _LOGGER.debug("Token refresh failed: %s", e)
+                _LOGGER.debug("Token refresh check failed: %s", e)
 
-            state = await controller.get_tv_state() or {"statetype": "fake_sleep_0"}
+            # Get TV state
+            state = await controller.get_tv_state()
+            
+            if not state:
+                _LOGGER.debug("No TV state received, TV might be off")
+                return {
+                    "statetype": "fake_sleep_0",
+                    "volume": None,
+                    "sources": [],
+                    "apps": []
+                }
 
+            # Only fetch additional data if TV is on
             if state.get("statetype") != "fake_sleep_0":
                 try:
-                    state["volume"] = await controller.get_volume()
-                    state["sources"] = await controller.get_source_list()
-                    state["apps"] = await controller.get_app_list()
-                except Exception as inner_err:
-                    _LOGGER.debug("Partial update failed: %s", inner_err)
+                    # Fetch volume, sources and apps in parallel
+                    volume, sources, apps = await asyncio.gather(
+                        controller.get_volume(),
+                        controller.get_source_list(),
+                        controller.get_app_list(),
+                        return_exceptions=True
+                    )
+                    
+                    # Handle results that might be exceptions
+                    state["volume"] = volume if not isinstance(volume, Exception) else None
+                    state["sources"] = sources if not isinstance(sources, Exception) else []
+                    state["apps"] = apps if not isinstance(apps, Exception) else []
+                    
+                except Exception as e:
+                    _LOGGER.debug("Failed to fetch additional TV data: %s", e)
+                    state["volume"] = None
+                    state["sources"] = []
+                    state["apps"] = []
+            else:
+                state["volume"] = None
+                state["sources"] = []
+                state["apps"] = []
 
             return state
 
         except Exception as err:
-            _LOGGER.debug("TV update failed (likely off): %s", err)
-            return {"statetype": "fake_sleep_0"}
+            _LOGGER.debug("TV update failed (likely powered off): %s", err)
+            # Return offline state instead of raising UpdateFailed
+            return {
+                "statetype": "fake_sleep_0",
+                "volume": None,
+                "sources": [],
+                "apps": []
+            }
 
+    # Create coordinator
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
-        name="Hisense TV Coordinator",
+        name=f"Hisense TV {ip}",
         update_method=async_update_data,
         update_interval=timedelta(seconds=30),
     )
 
+    # Do initial refresh
     await coordinator.async_config_entry_first_refresh()
 
+    # Store controller and coordinator
     hass.data[DOMAIN][entry.entry_id] = {
         "controller": controller,
         "coordinator": coordinator,
     }
 
+    # Forward setup to platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    _LOGGER.debug("Better Hisense TV setup complete for %s", entry.entry_id)
-    return True  # ✅ <- das ist zwingend nötig!
+    _LOGGER.info("Better Hisense TV setup complete for %s", ip)
+    return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Unload integration and clean up."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    
     if unload_ok:
+        # Clean up controller connection
+        data = hass.data[DOMAIN].get(entry.entry_id)
+        if data:
+            controller = data.get("controller")
+            if controller and controller.client:
+                try:
+                    controller.client.loop_stop()
+                    controller.client.disconnect()
+                except Exception as e:
+                    _LOGGER.debug("Error during controller cleanup: %s", e)
+        
         hass.data[DOMAIN].pop(entry.entry_id, None)
+    
     return unload_ok

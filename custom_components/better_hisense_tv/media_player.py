@@ -9,6 +9,7 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
 )
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNKNOWN, ATTR_ATTRIBUTION, STATE_IDLE, STATE_PLAYING, STATE_PAUSED
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from custom_components.better_hisense_tv.tv_controller import HisenseTVController
 
@@ -39,14 +40,15 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities([HisenseTVEntity(controller, coordinator)], True)
 
 
-class HisenseTVEntity(MediaPlayerEntity):
+class HisenseTVEntity(CoordinatorEntity, MediaPlayerEntity):
     """Representation of a Hisense TV as a media_player entity."""
 
-    _attr_name = "Hisense TV"
     _attr_supported_features = (
         MediaPlayerEntityFeature.TURN_ON
         | MediaPlayerEntityFeature.TURN_OFF
         | MediaPlayerEntityFeature.VOLUME_SET
+        | MediaPlayerEntityFeature.VOLUME_STEP
+        | MediaPlayerEntityFeature.VOLUME_MUTE
         | MediaPlayerEntityFeature.PLAY
         | MediaPlayerEntityFeature.PAUSE
         | MediaPlayerEntityFeature.STOP
@@ -54,154 +56,222 @@ class HisenseTVEntity(MediaPlayerEntity):
     )
 
     def __init__(self, controller: HisenseTVController, coordinator):
+        """Initialize the Hisense TV entity."""
+        super().__init__(coordinator)
         self._controller = controller
-        self._coordinator = coordinator
-        self._attr_unique_id = controller.client_id or "hisense_tv"
-        self._state = STATE_UNKNOWN
-        self._volume = None
-        self._sources: list[str] = []
-        self._apps: list[dict] = []
-        self._current_source: str | None = None
-        self._current_app: str | None = None
-        self._muted: bool = False
-        self._title: str | None = None
-
-    async def async_update(self):
-
-        if not self._controller.is_connected:
-            _LOGGER.debug("TV not connected, assuming OFF.")
-            self._state = STATE_OFF
-            return
-
-        try:
-            self._coordinator.data = await self._controller.get_tv_state()
-        except Exception as e:
-            _LOGGER.debug("TV state not available: %s", e)
-            self._state = STATE_OFF
-            return
-
-        data = self._coordinator.data or {}
-        if data.get("statetype") == "fake_sleep_0":
-            self._state = STATE_OFF
-        else:
-            self._state = STATE_ON
-            
-        self._state = STATE_ON
-        self._volume = (data.get("volume") or {}).get("volumevalue", 0) / 100
-        self._sources = data.get("sources") or []
-        self._apps = data.get("apps") or []
-        
+        self._attr_unique_id = f"hisense_tv_{controller.client_id or 'unknown'}"
+        self._attr_name = "Hisense TV"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, controller.client_id or "unknown")},
+            "name": "Hisense TV",
+            "manufacturer": "Hisense",
+            "model": "VIDAa TV",
+        }
 
     @property
     def state(self):
-        data = self._coordinator.data or {}
-        if not data:
-            return self._state
+        """Return the state of the device."""
+        if not self.coordinator.data:
+            return STATE_UNKNOWN
+        
+        if not self._controller.is_connected:
+            return STATE_OFF
+            
+        data = self.coordinator.data
         if data.get("statetype") == "fake_sleep_0":
-            self._state = STATE_OFF
-        else:
-            self._state = STATE_ON
-        return self._state
+            return STATE_OFF
+        
+        return STATE_ON
 
     @property
     def volume_level(self) -> float | None:
         """Return the current volume (0–1)."""
-        if self._volume is not None:
-            return self._volume
+        if not self.coordinator.data:
+            return None
+        
+        volume_data = self.coordinator.data.get("volume")
+        if volume_data and "volumevalue" in volume_data:
+            return volume_data["volumevalue"] / 100.0
+        return None
+
+    @property
+    def is_volume_muted(self) -> bool | None:
+        """Return boolean if volume is currently muted."""
+        if not self.coordinator.data:
+            return None
+        
+        volume_data = self.coordinator.data.get("volume")
+        if volume_data:
+            return volume_data.get("mute", False)
+        return None
+
+    @property
+    def source_list(self):
+        """Return cached list of available sources."""
+        if not self.coordinator.data:
+            return []
+        
+        sources = self.coordinator.data.get("sources") or []
+        apps = self.coordinator.data.get("apps") or []
+        
+        source_names = [s.get("displayname") for s in sources if s.get("displayname")]
+        app_names = [a.get("name") for a in apps if a.get("name")]
+        
+        return source_names + app_names
+
+    @property
+    def source(self):
+        """Return currently selected source."""
+        if not self.coordinator.data:
+            return None
+        
+        data = self.coordinator.data
+        
+        # Try to get current source from TV state
+        current_source_id = data.get("sourceid")
+        if current_source_id:
+            sources = data.get("sources") or []
+            for src in sources:
+                if src.get("sourceid") == current_source_id:
+                    return src.get("displayname")
+        
         return None
 
     async def async_turn_on(self):
+        """Turn the TV on."""
         _LOGGER.debug("Turning on Hisense TV")
-        await self._coordinator.async_request_refresh()
         
         try:
             if self._controller.is_connected:
                 await self._controller.turn_on()
             else:
+                # Fallback to Wake-on-LAN
                 _LOGGER.debug("TV not connected — sending Wake-on-LAN packet.")
+                # TODO: Make MAC address configurable
                 wakeonlan.send_magic_packet(
                     "bc:5c:17:da:bc:5e", ip_address=self._controller.tv_ip
                 )
-            self._state = STATE_ON
+            
+            # Wait a bit for TV to wake up
+            await asyncio.sleep(2)
+            await self.coordinator.async_request_refresh()
+            
         except Exception as e:
-            _LOGGER.warning("Unable to turn on TV: %s", e)
-        finally:
-            await self._coordinator.async_request_refresh()
+            _LOGGER.error("Unable to turn on TV: %s", e)
 
     async def async_turn_off(self):
+        """Turn the TV off."""
         _LOGGER.debug("Turning off Hisense TV")
-        await self._controller.turn_off()
-        self._coordinator.data = await self._controller.get_tv_state()
-        await self._coordinator.async_request_refresh()
+        try:
+            await self._controller.turn_off()
+            await asyncio.sleep(1)
+            await self.coordinator.async_request_refresh()
+        except Exception as e:
+            _LOGGER.error("Unable to turn off TV: %s", e)
 
     async def async_set_volume_level(self, volume: float):
         """Set the volume level (0-1)."""
-        await self._controller.change_volume(volume * 100)
-        self._volume = volume
-        await self._coordinator.async_request_refresh()
+        try:
+            volume_int = int(volume * 100)
+            await self._controller.change_volume(volume_int)
+            # Small delay before refresh
+            await asyncio.sleep(0.5)
+            await self.coordinator.async_request_refresh()
+        except Exception as e:
+            _LOGGER.error("Unable to set volume: %s", e)
 
     async def async_volume_up(self):
         """Volume up the media player."""
-        if self._volume < 100:
-            self._volume = self._volume + 1
-        await self._controller.send_key("KEY_VOLUMEUP")
+        try:
+            await self._controller.send_key("KEY_VOLUMEUP")
+            await asyncio.sleep(0.3)
+            await self.coordinator.async_request_refresh()
+        except Exception as e:
+            _LOGGER.error("Unable to increase volume: %s", e)
 
     async def async_volume_down(self):
         """Volume down media player."""
-        if self._volume > 0:
-            self._volume = self._volume - 1
-        await self._controller.send_key("KEY_VOLUMEDOWN")
+        try:
+            await self._controller.send_key("KEY_VOLUMEDOWN")
+            await asyncio.sleep(0.3)
+            await self.coordinator.async_request_refresh()
+        except Exception as e:
+            _LOGGER.error("Unable to decrease volume: %s", e)
 
     async def async_mute_volume(self, mute):
         """Send mute command."""
-        self._muted = mute
-        await self._controller.send_key("KEY_MUTE")
+        try:
+            await self._controller.send_key("KEY_MUTE")
+            await asyncio.sleep(0.3)
+            await self.coordinator.async_request_refresh()
+        except Exception as e:
+            _LOGGER.error("Unable to mute/unmute: %s", e)
 
     async def async_media_play(self):
-        await self._controller.send_key("KEY_PLAY")
-        self._state = STATE_PLAYING
+        """Send play command."""
+        try:
+            await self._controller.send_key("KEY_PLAY")
+        except Exception as e:
+            _LOGGER.error("Unable to send play command: %s", e)
 
     async def async_media_pause(self):
-        await self._controller.send_key("KEY_PAUSE")
-        self._state = STATE_PAUSED
+        """Send pause command."""
+        try:
+            await self._controller.send_key("KEY_PAUSE")
+        except Exception as e:
+            _LOGGER.error("Unable to send pause command: %s", e)
 
     async def async_media_stop(self):
-        await self._controller.send_key("KEY_STOP")
-        self._state = STATE_IDLE
-
-    @property
-    def source_list(self):
-        """Return cached list of available sources."""
-        return [
-            *[s.get("displayname") for s in self._sources],
-            *[s.get("name") for s in self._apps]
-        ]
-
-    @property
-    def source(self):
-        """Return currently selected source."""
-        return self._current_source or self._current_app
+        """Send stop command."""
+        try:
+            await self._controller.send_key("KEY_STOP")
+        except Exception as e:
+            _LOGGER.error("Unable to send stop command: %s", e)
 
     async def async_select_source(self, source: str):
-
-        src = next((x for x in self._apps if x["name"] == source), None)
-        if src is not None:
-            await self._controller.launch_app(src["name"])
-            self._current_app = src
-            self._current_source = None
-        else:
-            src = next(x for x in self._sources if x["displayname"] == source)
-            await self._controller.change_source(src["sourceid"])
-            self._current_source = src
-            self._current_app = None
-        await self._coordinator.async_request_refresh()
+        """Select input source."""
+        try:
+            if not self.coordinator.data:
+                _LOGGER.warning("No coordinator data available")
+                return
+            
+            sources = self.coordinator.data.get("sources") or []
+            apps = self.coordinator.data.get("apps") or []
+            
+            # Try to find in apps first
+            app = next((a for a in apps if a.get("name") == source), None)
+            if app:
+                await self._controller.launch_app(app["name"], apps)
+                await asyncio.sleep(1)
+                await self.coordinator.async_request_refresh()
+                return
+            
+            # Try to find in sources
+            src = next((s for s in sources if s.get("displayname") == source), None)
+            if src:
+                await self._controller.change_source(src["sourceid"])
+                await asyncio.sleep(1)
+                await self.coordinator.async_request_refresh()
+                return
+            
+            _LOGGER.warning("Source '%s' not found", source)
+            
+        except Exception as e:
+            _LOGGER.error("Unable to select source: %s", e)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {
+        """Return entity specific state attributes."""
+        attrs = {
             ATTR_ATTRIBUTION: "Better Hisense TV integration",
             "client_id": self._controller.client_id,
             "username": self._controller.username,
             "ip_address": self._controller.tv_ip,
-            "password": self._controller.password,
         }
+        
+        # Add debug info if available
+        if self.coordinator.data:
+            attrs["statetype"] = self.coordinator.data.get("statetype")
+            attrs["connected"] = self._controller.is_connected
+        
+        return attrs
